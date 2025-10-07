@@ -7,3 +7,6 @@ config.toml
 bin/*.env
 *.sh
 *.DS_Store
+*private_key*.json
+*.env copy
+.env copy
