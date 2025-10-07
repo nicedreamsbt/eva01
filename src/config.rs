@@ -15,6 +15,9 @@ pub struct Eva01Config {
 
 impl Eva01Config {
     pub fn new() -> anyhow::Result<Self> {
+        // Load environment variables from .env file
+        dotenv::dotenv().ok();
+        
         //General configuration
         let rpc_url = std::env::var("RPC_URL").expect("RPC_URL environment variable is not set");
 

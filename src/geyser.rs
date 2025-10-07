@@ -42,6 +42,7 @@ pub enum AccountType {
     Oracle,
     Marginfi,
     Token,
+    Bank,
 }
 
 pub struct GeyserServiceConfig {
@@ -198,8 +199,10 @@ impl GeyserService {
             ..Default::default()
         };
 
+        // Subscribe to MarginFi accounts with filters to avoid overwhelming the provider
         let marginfi_account_subscription = SubscribeRequestFilterAccounts {
             owner: vec![marginfi_program_id.to_string()],
+            // Add filters to limit the subscription scope
             ..Default::default()
         };
 

@@ -106,10 +106,7 @@ impl CacheLoader {
         let marginfi_accounts = batch_get_multiple_accounts(
             &self.rpc_client,
             &marginfi_accounts_pubkeys,
-            BatchLoadingConfig {
-                max_batch_size: BatchLoadingConfig::DEFAULT.max_batch_size,
-                max_concurrent_calls: 32,
-            },
+            BatchLoadingConfig::FAST,  // Use fast config for marginfi accounts (biggest improvement)
         )?;
 
         for (address, account_opt) in marginfi_accounts_pubkeys
@@ -215,13 +212,22 @@ impl CacheLoader {
         let oracle_accounts = batch_get_multiple_accounts(
             &self.rpc_client,
             &oracle_addresses,
-            BatchLoadingConfig::DEFAULT,
+            BatchLoadingConfig::FAST,  // Use fast config for oracles
         )?;
         let oracle_map: HashMap<Pubkey, Account> = oracle_addresses
             .iter()
             .zip(oracle_accounts.iter())
             .filter_map(|(pk, account)| account.as_ref().map(|acc| (*pk, acc.clone())))
             .collect();
+
+        // Check for missing oracle accounts
+        let missing_count = oracle_addresses.iter().zip(oracle_accounts.iter())
+            .filter(|(_, account_opt)| account_opt.is_none())
+            .count();
+        
+        if missing_count > 0 {
+            thread_warn!("⚠️ WARNING: {} oracle accounts could not be loaded", missing_count);
+        }
 
         for (oracle_address, oracle_account) in oracle_map.iter() {
             thread_debug!("Loaded the Oracle {:?} .", oracle_address);
@@ -241,7 +247,7 @@ impl CacheLoader {
         let mint_accounts = batch_get_multiple_accounts(
             &self.rpc_client,
             &mint_addresses,
-            BatchLoadingConfig::DEFAULT,
+            BatchLoadingConfig::FAST,  // Use fast config for mints
         )?;
 
         for (mint_address, mint_account_opt) in mint_addresses.iter().zip(mint_accounts.iter()) {
@@ -272,7 +278,7 @@ impl CacheLoader {
         let token_accounts = batch_get_multiple_accounts(
             &self.rpc_client,
             &token_addresses,
-            BatchLoadingConfig::DEFAULT,
+            BatchLoadingConfig::FAST,  // Use fast config for token accounts
         )?;
 
         let mut new_token_addresses: Vec<Pubkey> = vec![];
@@ -389,12 +395,19 @@ impl CacheLoader {
 pub fn get_accounts_to_track(cache: &Cache) -> Result<HashMap<Pubkey, AccountType>> {
     let mut accounts: HashMap<Pubkey, AccountType> = HashMap::new();
 
+    // Track oracles (price feeds)
     for oracle_pk in cache.oracles.try_get_addresses()? {
         accounts.insert(oracle_pk, AccountType::Oracle);
     }
 
+    // Track tokens (mint accounts)
     for token in cache.mints.get_tokens() {
         accounts.insert(token, AccountType::Token);
+    }
+
+    // Track banks (lending/borrowing state - these update frequently!)
+    for bank_pk in cache.banks.get_addresses() {
+        accounts.insert(bank_pk, AccountType::Bank);
     }
 
     Ok(accounts)

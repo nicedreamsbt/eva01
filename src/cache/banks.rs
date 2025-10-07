@@ -56,6 +56,25 @@ impl BanksCache {
     pub fn len(&self) -> usize {
         self.banks.len()
     }
+
+    pub fn get_addresses(&self) -> Vec<Pubkey> {
+        self.banks.keys().cloned().collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Pubkey, &BankWrapper)> {
+        self.banks.iter()
+    }
+
+    pub fn get_banks_using_oracle(&self, oracle_address: &Pubkey) -> Vec<Pubkey> {
+        self.banks
+            .iter()
+            .filter(|(_, bank_wrapper)| {
+                let oracle_keys = find_oracle_keys(&bank_wrapper.bank.config);
+                oracle_keys.contains(oracle_address)
+            })
+            .map(|(bank_address, _)| *bank_address)
+            .collect()
+    }
 }
 
 #[cfg(test)]

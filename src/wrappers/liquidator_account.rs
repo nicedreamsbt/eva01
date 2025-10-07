@@ -18,6 +18,7 @@ use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig}
 
 use crate::wrappers::oracle::OracleWrapperTrait;
 use solana_program::pubkey::Pubkey;
+use std::str::FromStr;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -119,7 +120,15 @@ impl LiquidatorAccount {
 
             liquidator_marginfi_account
         } else {
-            accounts[0]
+            // Prefer the funded account: CUANYWWJX3J2CPZNRKyzq7iV2zpETipG2VntG3P6kH5P
+            let funded_account = Pubkey::from_str("CUANYWWJX3J2CPZNRKyzq7iV2zpETipG2VntG3P6kH5P").unwrap();
+            if accounts.contains(&funded_account) {
+                thread_info!("Using funded account: {}", funded_account);
+                funded_account
+            } else {
+                thread_info!("Using first available account: {}", accounts[0]);
+                accounts[0]
+            }
         };
 
         let preferred_mint_bank = cache.banks.try_get_account_for_mint(&preferred_mint)?;

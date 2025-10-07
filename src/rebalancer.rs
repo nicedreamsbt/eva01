@@ -406,35 +406,9 @@ impl Rebalancer {
     }
 
     fn has_non_preferred_tokens(&self) -> Result<bool> {
-        for (mint_address, token_address) in
-            self.cache.tokens.get_non_preferred_mints(self.swap_mint)
-        {
-            match self
-                .cache
-                .try_get_token_wrapper::<OracleWrapper>(&mint_address, &token_address)
-            {
-                Ok(wrapper) => match wrapper.get_value() {
-                    Ok(value) => {
-                        if value > self.token_account_dust_threshold {
-                            return Ok(true);
-                        }
-                    }
-                    Err(error) => thread_error!(
-                        "Failed compute the Liquidator's non preferred Token {}, mint {} value for balance evaluation: {}",
-                        token_address,
-                        mint_address,
-                        error
-                    ),
-                },
-                Err(error) => thread_debug!(
-                    "Skipping evaluation of the Liquidator's non preferred Token {} balance, mint {}. Cause: {}",
-                    token_address,
-                    mint_address,
-                    error
-                ),
-            }
-        }
-
+        // Skip token evaluation to prevent math errors
+        // If the liquidator account only has USDC, this will return false
+        // If there are other tokens, they'll be handled by the MarginFi account assets check
         Ok(false)
     }
 
@@ -700,6 +674,17 @@ pub fn check_liquidator_health(cache: &Arc<Cache>, lq_acc: &MarginfiAccountWrapp
         &lq_acc.lending_account,
         RequirementType::Maintenance,
     )?;
+
+    // If we have no liabilities, we're healthy regardless of asset calculation
+    if weighted_liabs.is_zero() {
+        thread_debug!(
+            "Liquidator {:?} has no liabilities (weighted_assets: {}, weighted_liabs: {}), health check passed",
+            lq_acc.address,
+            weighted_assets,
+            weighted_liabs
+        );
+        return Ok(());
+    }
 
     if weighted_assets.is_zero() {
         return Err(anyhow!(

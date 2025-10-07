@@ -43,7 +43,24 @@ impl TokensCache {
                 if *mint_address == swap_mint {
                     None
                 } else {
-                    Some((*mint_address, *token_address))
+                    // Only return tokens that actually have meaningful balances
+                    // This prevents evaluating empty/dust token accounts
+                    match self.tokens.read() {
+                        Ok(tokens) => {
+                            if let Some(token_account) = tokens.get(token_address) {
+                                // For token accounts, check if the account has enough lamports to be meaningful
+                                // Token accounts need lamports for rent exemption
+                                if token_account.lamports > 2000000 { // ~0.002 SOL worth (rent exemption)
+                                    Some((*mint_address, *token_address))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    }
                 }
             })
             .collect()

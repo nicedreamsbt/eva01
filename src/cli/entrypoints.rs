@@ -87,13 +87,16 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         cache.clone(),
     )?);
 
-    let mut liquidator = Liquidator::new(
+    let liquidator = Liquidator::new(
         config.clone(),
         liquidator_account.clone(),
         run_liquidation.clone(),
         stop_liquidator.clone(),
         cache.clone(),
     )?;
+
+    // Wrap liquidator in Mutex for sharing with GeyserProcessor
+    let liquidator_mutex = Arc::new(std::sync::Mutex::new(liquidator));
 
     let geyser_service = GeyserService::new(
         config.general_config,
@@ -108,6 +111,7 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         run_liquidation.clone(),
         stop_liquidator.clone(),
         cache,
+        liquidator_mutex.clone(),
     )?;
 
     thread_info!("Starting services...");
@@ -116,7 +120,7 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
     thread::spawn(move || clock_manager.start(cloned_stop));
 
     thread::spawn(move || {
-        if let Err(e) = liquidator.start() {
+        if let Err(e) = liquidator_mutex.lock().unwrap().start() {
             thread_error!("The Liquidator service failed! {:?}", e);
             panic!("Fatal error in the Liquidator service!");
         }
