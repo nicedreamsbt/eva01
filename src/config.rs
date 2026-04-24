@@ -17,7 +17,7 @@ impl Eva01Config {
     pub fn new() -> anyhow::Result<Self> {
         // Load environment variables from .env file
         dotenv::dotenv().ok();
-        
+
         //General configuration
         let rpc_url = std::env::var("RPC_URL").expect("RPC_URL environment variable is not set");
 
@@ -59,6 +59,10 @@ impl Eva01Config {
             .expect("SOLANA_CLOCK_REFRESH_INTERVAL environment variable is not set")
             .parse()
             .expect("Invalid SOLANA_CLOCK_REFRESH_INTERVAL number");
+        let flashloan_liquidation: bool = std::env::var("FLASHLOAN_LIQUIDATION")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .expect("Invalid FLASHLOAN_LIQUIDATION boolean");
 
         let min_profit: f64 = std::env::var("MIN_PROFIT")
             .expect("MIN_PROFIT environment variable is not set")
@@ -85,6 +89,7 @@ impl Eva01Config {
             marginfi_group_key,
             address_lookup_tables,
             solana_clock_refresh_interval,
+            flashloan_liquidation,
             min_profit,
             healthcheck_port,
             crossbar_api_url,
@@ -200,6 +205,7 @@ pub struct GeneralConfig {
     pub marginfi_group_key: Pubkey,
     pub address_lookup_tables: Vec<Pubkey>,
     pub solana_clock_refresh_interval: u64,
+    pub flashloan_liquidation: bool,
     pub min_profit: f64,
     pub healthcheck_port: u16,
     pub crossbar_api_url: Option<String>,

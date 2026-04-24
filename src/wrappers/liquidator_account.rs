@@ -4,8 +4,8 @@ use crate::{
     cli::setup::marginfi_account_by_authority,
     config::GeneralConfig,
     marginfi_ixs::{
-        initialize_marginfi_account, make_deposit_ix, make_liquidate_ix, make_repay_ix,
-        make_withdraw_ix,
+        initialize_marginfi_account, make_deposit_ix, make_end_flashloan_ix, make_liquidate_ix,
+        make_repay_ix, make_start_flashloan_ix, make_withdraw_ix,
     },
     metrics::LIQUIDATION_ATTEMPTS,
     thread_debug, thread_info, thread_warn,
@@ -13,12 +13,17 @@ use crate::{
     wrappers::oracle::OracleWrapper,
 };
 use anyhow::{anyhow, Result};
+use jupiter_swap_api_client::{
+    quote::QuoteRequest,
+    swap::SwapRequest,
+    transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
+    JupiterSwapApiClient,
+};
 use marginfi_type_crate::types::BalanceSide;
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 
 use crate::wrappers::oracle::OracleWrapperTrait;
 use solana_program::pubkey::Pubkey;
-use std::str::FromStr;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -31,7 +36,14 @@ use solana_sdk::{
     system_instruction::transfer,
     transaction::VersionedTransaction,
 };
-use std::{collections::HashSet, sync::Arc, thread, time::Duration};
+use std::str::FromStr;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+use tokio::runtime::Builder;
 
 #[derive(Debug)]
 pub struct LiquidationError {
@@ -74,6 +86,12 @@ pub struct LiquidatorAccount {
     preferred_mint_bank: Pubkey,
     rpc_client: RpcClient,
     cu_limit_ix: Instruction,
+    cu_price_ix: Instruction,
+    flashloan_enabled: bool,
+    jup_swap_api_url: String,
+    slippage_bps: u16,
+    compute_unit_price_micro_lamports: ComputeUnitPriceMicroLamports,
+    jup_lut_cache: Arc<Mutex<HashMap<Pubkey, AddressLookupTableAccount>>>,
     pub cache: Arc<Cache>,
 }
 
@@ -82,6 +100,8 @@ impl LiquidatorAccount {
         config: &GeneralConfig,
         marginfi_group_id: Pubkey,
         preferred_mint: Pubkey,
+        jup_swap_api_url: String,
+        slippage_bps: u16,
         cache: Arc<Cache>,
     ) -> Result<Self> {
         let signer = Keypair::from_bytes(&config.wallet_keypair)?;
@@ -121,7 +141,8 @@ impl LiquidatorAccount {
             liquidator_marginfi_account
         } else {
             // Prefer the funded account: CUANYWWJX3J2CPZNRKyzq7iV2zpETipG2VntG3P6kH5P
-            let funded_account = Pubkey::from_str("CUANYWWJX3J2CPZNRKyzq7iV2zpETipG2VntG3P6kH5P").unwrap();
+            let funded_account =
+                Pubkey::from_str("CUANYWWJX3J2CPZNRKyzq7iV2zpETipG2VntG3P6kH5P").unwrap();
             if accounts.contains(&funded_account) {
                 thread_info!("Using funded account: {}", funded_account);
                 funded_account
@@ -132,6 +153,12 @@ impl LiquidatorAccount {
         };
 
         let preferred_mint_bank = cache.banks.try_get_account_for_mint(&preferred_mint)?;
+        let jup_lut_cache = cache
+            .luts
+            .iter()
+            .cloned()
+            .map(|lut| (lut.key, lut))
+            .collect::<HashMap<_, _>>();
 
         Ok(Self {
             liquidator_address,
@@ -143,6 +170,16 @@ impl LiquidatorAccount {
             cu_limit_ix: ComputeBudgetInstruction::set_compute_unit_limit(
                 config.compute_unit_limit,
             ),
+            cu_price_ix: ComputeBudgetInstruction::set_compute_unit_price(
+                config.compute_unit_price_micro_lamports,
+            ),
+            flashloan_enabled: config.flashloan_liquidation,
+            jup_swap_api_url,
+            slippage_bps,
+            compute_unit_price_micro_lamports: ComputeUnitPriceMicroLamports::MicroLamports(
+                config.compute_unit_price_micro_lamports,
+            ),
+            jup_lut_cache: Arc::new(Mutex::new(jup_lut_cache)),
             cache,
         })
     }
@@ -166,7 +203,40 @@ impl LiquidatorAccount {
         Ok(validation_result.unwrap_or(false))
     }
 
+    pub fn flashloan_enabled(&self) -> bool {
+        self.flashloan_enabled
+    }
+
     pub fn liquidate(
+        &self,
+        liquidatee_account: &MarginfiAccountWrapper,
+        asset_bank: &Pubkey,
+        liab_bank: &Pubkey,
+        asset_amount: u64,
+        liab_amount: u64,
+        stale_swb_oracles: &HashSet<Pubkey>,
+    ) -> Result<(), LiquidationError> {
+        if self.flashloan_enabled {
+            return self.liquidate_with_flashloan(
+                liquidatee_account,
+                asset_bank,
+                liab_bank,
+                asset_amount,
+                liab_amount,
+                stale_swb_oracles,
+            );
+        }
+        self.liquidate_with_prefunded_capital(
+            liquidatee_account,
+            asset_bank,
+            liab_bank,
+            asset_amount,
+            liab_amount,
+            stale_swb_oracles,
+        )
+    }
+
+    fn liquidate_with_prefunded_capital(
         &self,
         liquidatee_account: &MarginfiAccountWrapper,
         asset_bank: &Pubkey,
@@ -381,6 +451,354 @@ impl LiquidatorAccount {
                 ))
             }
         }
+    }
+
+    fn liquidate_with_flashloan(
+        &self,
+        liquidatee_account: &MarginfiAccountWrapper,
+        asset_bank: &Pubkey,
+        liab_bank: &Pubkey,
+        asset_amount: u64,
+        liab_amount: u64,
+        stale_swb_oracles: &HashSet<Pubkey>,
+    ) -> Result<(), LiquidationError> {
+        let liquidatee_account_address = liquidatee_account.address;
+        thread_info!(
+            "Flashloan liquidation for account {:?} with liquidator {:?}. Asset amount: {}, liab amount: {}",
+            liquidatee_account_address,
+            self.liquidator_address,
+            asset_amount,
+            liab_amount
+        );
+
+        let asset_bank_wrapper = self
+            .cache
+            .banks
+            .try_get_bank(asset_bank)
+            .map_err(LiquidationError::from_anyhow_error)?;
+        let asset_oracle_wrapper = OracleWrapper::build(&self.cache, asset_bank)
+            .map_err(LiquidationError::from_anyhow_error)?;
+        let liab_bank_wrapper = self
+            .cache
+            .banks
+            .try_get_bank(liab_bank)
+            .map_err(LiquidationError::from_anyhow_error)?;
+        let liab_oracle_wrapper = OracleWrapper::build(&self.cache, liab_bank)
+            .map_err(LiquidationError::from_anyhow_error)?;
+
+        let signer_pk = self.signer.pubkey();
+        let liab_mint = liab_bank_wrapper.bank.mint;
+        let asset_mint = asset_bank_wrapper.bank.mint;
+
+        let liquidator_account = &self
+            .cache
+            .marginfi_accounts
+            .try_get_account(&self.liquidator_address)
+            .map_err(LiquidationError::from_anyhow_error)?;
+        let lending_account = &liquidator_account.lending_account;
+
+        for bank_pk in [*liab_bank, *asset_bank] {
+            let bank_to_validate_against = self
+                .cache
+                .banks
+                .try_get_bank(&bank_pk)
+                .map_err(LiquidationError::from_anyhow_error)?;
+            if !check_asset_tags_matching(&bank_to_validate_against.bank, lending_account) {
+                thread_debug!(
+                    "Bank {:?} does not match asset tags for flashloan liquidation -> skipping",
+                    bank_pk
+                );
+                return Ok(());
+            }
+        }
+
+        LIQUIDATION_ATTEMPTS.inc();
+
+        let (liquidator_observation_accounts, liquidator_swb_oracles) =
+            MarginfiAccountWrapper::get_observation_accounts::<OracleWrapper>(
+                lending_account,
+                &[*liab_bank, *asset_bank],
+                &[],
+                self.cache.clone(),
+            )
+            .map_err(LiquidationError::from_anyhow_error)?;
+
+        if contains_stale_oracles(stale_swb_oracles, &liquidator_swb_oracles) {
+            thread_warn!("Skipping flashloan liquidation: liquidator has stale oracles.");
+            return Ok(());
+        }
+
+        let (liquidatee_observation_accounts, liquidatee_swb_oracles) =
+            MarginfiAccountWrapper::get_observation_accounts::<OracleWrapper>(
+                &liquidatee_account.lending_account,
+                &[],
+                &[],
+                self.cache.clone(),
+            )
+            .map_err(LiquidationError::from_anyhow_error)?;
+
+        if contains_stale_oracles(stale_swb_oracles, &liquidatee_swb_oracles) {
+            thread_warn!("Skipping flashloan liquidation: liquidatee has stale oracles.");
+            return Ok(());
+        }
+
+        let joined_observation_accounts = liquidator_observation_accounts
+            .iter()
+            .chain(liquidatee_observation_accounts.iter())
+            .copied()
+            .collect::<Vec<_>>();
+
+        let liab_token_account = self
+            .cache
+            .tokens
+            .try_get_token_for_mint(&liab_mint)
+            .map_err(LiquidationError::from_anyhow_error)?;
+        let asset_token_account = self
+            .cache
+            .tokens
+            .try_get_token_for_mint(&asset_mint)
+            .map_err(LiquidationError::from_anyhow_error)?;
+
+        let borrow_liab_ix = make_withdraw_ix(
+            self.program_id,
+            self.group,
+            self.liquidator_address,
+            signer_pk,
+            &liab_bank_wrapper,
+            liab_token_account,
+            self.cache
+                .mints
+                .try_get_account(&liab_mint)
+                .map_err(LiquidationError::from_anyhow_error)?
+                .account
+                .owner,
+            liquidator_observation_accounts.clone(),
+            liab_amount,
+            Some(false),
+        );
+
+        let liquidate_ix = make_liquidate_ix(
+            self.program_id,
+            self.group,
+            self.liquidator_address,
+            &asset_bank_wrapper,
+            asset_oracle_wrapper.address,
+            &liab_bank_wrapper,
+            liab_oracle_wrapper.address,
+            signer_pk,
+            liquidatee_account_address,
+            self.cache
+                .mints
+                .try_get_account(&liab_mint)
+                .map_err(LiquidationError::from_anyhow_error)?
+                .account
+                .owner,
+            joined_observation_accounts.clone(),
+            asset_amount,
+        );
+
+        let withdraw_asset_ix = make_withdraw_ix(
+            self.program_id,
+            self.group,
+            self.liquidator_address,
+            signer_pk,
+            &asset_bank_wrapper,
+            asset_token_account,
+            self.cache
+                .mints
+                .try_get_account(&asset_mint)
+                .map_err(LiquidationError::from_anyhow_error)?
+                .account
+                .owner,
+            liquidator_observation_accounts.clone(),
+            asset_amount,
+            Some(false),
+        );
+
+        let tokio_rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| LiquidationError::from_anyhow_error(anyhow!(e)))?;
+        let jup_client = JupiterSwapApiClient::new(self.jup_swap_api_url.clone());
+        let quote = tokio_rt
+            .block_on(jup_client.quote(&QuoteRequest {
+                input_mint: asset_mint,
+                output_mint: liab_mint,
+                amount: asset_amount,
+                slippage_bps: self.slippage_bps,
+                ..Default::default()
+            }))
+            .map_err(|e| LiquidationError::from_anyhow_error(anyhow!(e)))?;
+
+        let swap_instructions = tokio_rt
+            .block_on(jup_client.swap_instructions(&SwapRequest {
+                user_public_key: signer_pk,
+                quote_response: quote,
+                config: TransactionConfig {
+                    wrap_and_unwrap_sol: false,
+                    compute_unit_price_micro_lamports: Some(
+                        self.compute_unit_price_micro_lamports.clone(),
+                    ),
+                    ..Default::default()
+                },
+            }))
+            .map_err(|e| LiquidationError::from_anyhow_error(anyhow!(e)))?;
+
+        let repay_flashloan_ix = make_repay_ix(
+            self.program_id,
+            self.group,
+            self.liquidator_address,
+            signer_pk,
+            &liab_bank_wrapper,
+            liab_token_account,
+            self.cache
+                .mints
+                .try_get_account(&liab_mint)
+                .map_err(LiquidationError::from_anyhow_error)?
+                .account
+                .owner,
+            u64::MAX,
+            Some(true),
+        );
+
+        let mut core_ixs = vec![
+            borrow_liab_ix,
+            liquidate_ix,
+            withdraw_asset_ix,
+            repay_flashloan_ix,
+        ];
+        core_ixs.splice(3..3, swap_instructions.setup_instructions.clone());
+        core_ixs.insert(3, swap_instructions.swap_instruction.clone());
+        if let Some(cleanup_ix) = swap_instructions.cleanup_instruction.clone() {
+            core_ixs.insert(4 + swap_instructions.setup_instructions.len(), cleanup_ix);
+        }
+        if let Some(token_ledger_ix) = swap_instructions.token_ledger_instruction.clone() {
+            core_ixs.insert(3, token_ledger_ix);
+        }
+        for extra_ix in swap_instructions.other_instructions.clone() {
+            core_ixs.push(extra_ix);
+        }
+
+        let start_flashloan_ix = make_start_flashloan_ix(
+            self.program_id,
+            self.liquidator_address,
+            signer_pk,
+            (core_ixs.len() + 1) as u64,
+        );
+        let end_flashloan_ix = make_end_flashloan_ix(
+            self.program_id,
+            self.liquidator_address,
+            signer_pk,
+            liquidator_observation_accounts,
+        );
+
+        let mut all_ixs = vec![
+            self.cu_limit_ix.clone(),
+            self.cu_price_ix.clone(),
+            start_flashloan_ix,
+        ];
+        all_ixs.extend(core_ixs);
+        all_ixs.push(end_flashloan_ix);
+
+        let recent_blockhash = self
+            .rpc_client
+            .get_latest_blockhash()
+            .map_err(|e| LiquidationError::from_anyhow_error(anyhow!(e)))?;
+
+        let mut luts: Vec<AddressLookupTableAccount> = self.cache.luts.clone();
+        if !swap_instructions.address_lookup_table_addresses.is_empty() {
+            let mut cached_luts = self
+                .load_jupiter_luts(&swap_instructions.address_lookup_table_addresses)
+                .map_err(LiquidationError::from_anyhow_error)?;
+            luts.append(&mut cached_luts);
+        }
+
+        let msg = Message::try_compile(&signer_pk, &all_ixs, &luts, recent_blockhash)
+            .map_err(LiquidationError::from_compile_error)?;
+        let txn = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
+            .map_err(LiquidationError::from_signer_error)?;
+
+        match self
+            .rpc_client
+            .send_and_confirm_transaction_with_spinner_and_config(
+                &txn,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    skip_preflight: false,
+                    preflight_commitment: Some(CommitmentLevel::Processed),
+                    ..Default::default()
+                },
+            ) {
+            Ok(signature) => {
+                thread_info!(
+                    "Flashloan liquidation txn for account {} confirmed. Signature: {}",
+                    liquidatee_account_address,
+                    signature
+                );
+                Ok(())
+            }
+            Err(err) => {
+                let mut swb_oracles: Vec<Pubkey> = vec![];
+                if is_stale_swb_price_error(&err) {
+                    swb_oracles = liquidator_swb_oracles;
+                    for swb_oracle in liquidatee_swb_oracles {
+                        if !swb_oracles.contains(&swb_oracle) {
+                            swb_oracles.push(swb_oracle);
+                        }
+                    }
+                }
+                Err(LiquidationError::from_anyhow_error_with_keys(
+                    anyhow!(
+                        "Flashloan liquidation txn for account {} failed: {}",
+                        liquidatee_account_address,
+                        err
+                    ),
+                    swb_oracles,
+                ))
+            }
+        }
+    }
+
+    fn load_jupiter_luts(
+        &self,
+        lut_addresses: &[Pubkey],
+    ) -> Result<Vec<AddressLookupTableAccount>> {
+        let mut cache_guard = self
+            .jup_lut_cache
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock Jupiter LUT cache: {:?}", e))?;
+
+        let mut result = Vec::with_capacity(lut_addresses.len());
+        let mut missing = Vec::new();
+        for lut_key in lut_addresses {
+            if let Some(lut) = cache_guard.get(lut_key) {
+                result.push(lut.clone());
+            } else {
+                missing.push(*lut_key);
+            }
+        }
+
+        if !missing.is_empty() {
+            let fetched = self.rpc_client.get_multiple_accounts(&missing)?;
+            for (lut_key, lut_account_opt) in missing.into_iter().zip(fetched.into_iter()) {
+                if let Some(lut_account) = lut_account_opt {
+                    if let Ok(lut_state) =
+                        solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(
+                            &lut_account.data,
+                        )
+                    {
+                        let lut = AddressLookupTableAccount {
+                            key: lut_key,
+                            addresses: lut_state.addresses.to_vec(),
+                        };
+                        cache_guard.insert(lut_key, lut.clone());
+                        result.push(lut);
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn withdraw(
