@@ -90,7 +90,7 @@ impl Liquidator {
 
     pub fn start(&mut self) -> Result<()> {
         // Fund the liquidator account, if needed
-        if !self.liquidator_account.has_funds()? {
+        if !self.liquidator_account.flashloan_enabled() && !self.liquidator_account.has_funds()? {
             return Err(anyhow!("Liquidator has no funds."));
         }
 
@@ -108,11 +108,11 @@ impl Liquidator {
         thread_info!("Staring the Liquidator loop.");
         let mut last_evaluation = Instant::now();
         let evaluation_interval = Duration::from_secs(30); // Run evaluations every 30 seconds
-        
+
         while !self.stop_liquidator.load(Ordering::Relaxed) {
-            let should_run_evaluation = self.run_liquidation.load(Ordering::Relaxed) 
+            let should_run_evaluation = self.run_liquidation.load(Ordering::Relaxed)
                 || last_evaluation.elapsed() > evaluation_interval;
-                
+
             if should_run_evaluation {
                 thread_info!("Running the Liquidation process...");
                 self.run_liquidation.store(false, Ordering::Relaxed);
@@ -200,7 +200,10 @@ impl Liquidator {
     }
 
     /// Check a specific account for liquidation opportunities
-    pub fn evaluate_specific_account(&mut self, account: &MarginfiAccountWrapper) -> Result<Option<PreparedLiquidatableAccount>> {
+    pub fn evaluate_specific_account(
+        &mut self,
+        account: &MarginfiAccountWrapper,
+    ) -> Result<Option<PreparedLiquidatableAccount>> {
         if account.address == self.liquidator_account.liquidator_address {
             return Ok(None);
         }
@@ -215,51 +218,68 @@ impl Liquidator {
                     Ok(None)
                 }
             }
-            Err(_) => Ok(None)
+            Err(_) => Ok(None),
         }
     }
 
     /// Check accounts that use a specific oracle
-    pub fn evaluate_accounts_using_oracle(&mut self, oracle_address: &Pubkey) -> Result<Vec<PreparedLiquidatableAccount>> {
+    pub fn evaluate_accounts_using_oracle(
+        &mut self,
+        oracle_address: &Pubkey,
+    ) -> Result<Vec<PreparedLiquidatableAccount>> {
         let mut result: Vec<PreparedLiquidatableAccount> = vec![];
-        
+
         thread_info!("Finding accounts using oracle {}", oracle_address);
-        
+
         // Find banks that use this oracle
-        let banks_using_oracle: Vec<Pubkey> = self.cache.banks
+        let banks_using_oracle: Vec<Pubkey> = self
+            .cache
+            .banks
             .iter()
             .filter(|(_, bank_wrapper)| {
                 // Check if this bank uses the oracle
-                bank_wrapper.bank.config.oracle_keys.contains(oracle_address)
+                bank_wrapper
+                    .bank
+                    .config
+                    .oracle_keys
+                    .contains(oracle_address)
             })
             .map(|(bank_address, _)| *bank_address)
             .collect();
-        
+
         if banks_using_oracle.is_empty() {
             thread_info!("No banks found using oracle {}", oracle_address);
             return Ok(result);
         }
-        
-        thread_info!("Found {} banks using oracle {}, checking accounts with positions in these banks", 
-                    banks_using_oracle.len(), oracle_address);
-        
+
+        thread_info!(
+            "Found {} banks using oracle {}, checking accounts with positions in these banks",
+            banks_using_oracle.len(),
+            oracle_address
+        );
+
         // Check all accounts for positions in these banks
         let total_accounts = self.cache.marginfi_accounts.len()?;
         let mut processed = 0;
-        
+
         for index in 0..total_accounts {
             match self.cache.marginfi_accounts.try_get_account_by_index(index) {
                 Ok(account) => {
                     if account.address == self.liquidator_account.liquidator_address {
                         continue;
                     }
-                    
+
                     // Check if this account has positions in any of the banks using this oracle
-                    let (deposit_shares, liab_shares) = account.get_deposits_and_liabilities_shares();
-                    
-                    let has_relevant_positions = deposit_shares.iter().any(|(_, bank_pk)| banks_using_oracle.contains(bank_pk))
-                        || liab_shares.iter().any(|(_, bank_pk)| banks_using_oracle.contains(bank_pk));
-                    
+                    let (deposit_shares, liab_shares) =
+                        account.get_deposits_and_liabilities_shares();
+
+                    let has_relevant_positions = deposit_shares
+                        .iter()
+                        .any(|(_, bank_pk)| banks_using_oracle.contains(bank_pk))
+                        || liab_shares
+                            .iter()
+                            .any(|(_, bank_pk)| banks_using_oracle.contains(bank_pk));
+
                     if has_relevant_positions {
                         // Quick health check first
                         match self.quick_health_check(&account) {
@@ -273,7 +293,11 @@ impl Liquidator {
                                             }
                                         }
                                         Err(e) => {
-                                            thread_trace!("Failed to process account {:?}: {:?}", account.address, e);
+                                            thread_trace!(
+                                                "Failed to process account {:?}: {:?}",
+                                                account.address,
+                                                e
+                                            );
                                             ERROR_COUNT.inc();
                                         }
                                     }
@@ -284,49 +308,61 @@ impl Liquidator {
                             }
                         }
                     }
-                    
+
                     processed += 1;
                 }
                 Err(err) => {
-                    thread_error!("Failed to get Marginfi account by index {}: {:?}", index, err);
+                    thread_error!(
+                        "Failed to get Marginfi account by index {}: {:?}",
+                        index,
+                        err
+                    );
                     ERROR_COUNT.inc();
                 }
             }
         }
-        
+
         thread_info!("Oracle-based evaluation complete: processed {} accounts, found {} liquidatable accounts using oracle {}", 
                     processed, result.len(), oracle_address);
-        
+
         Ok(result)
     }
 
     /// Check accounts that have positions in a specific bank
-    pub fn evaluate_accounts_with_positions_in_bank(&mut self, bank_address: &Pubkey) -> Result<Vec<PreparedLiquidatableAccount>> {
+    pub fn evaluate_accounts_with_positions_in_bank(
+        &mut self,
+        bank_address: &Pubkey,
+    ) -> Result<Vec<PreparedLiquidatableAccount>> {
         let mut result: Vec<PreparedLiquidatableAccount> = vec![];
-        
+
         thread_info!("Finding accounts with positions in bank {}", bank_address);
-        
+
         // Check all accounts for positions in this specific bank
         let total_accounts = self.cache.marginfi_accounts.len()?;
         let mut processed = 0;
         let mut accounts_with_positions = 0;
-        
+
         for index in 0..total_accounts {
             match self.cache.marginfi_accounts.try_get_account_by_index(index) {
                 Ok(account) => {
                     if account.address == self.liquidator_account.liquidator_address {
                         continue;
                     }
-                    
+
                     // Check if this account has positions in this specific bank
-                    let (deposit_shares, liab_shares) = account.get_deposits_and_liabilities_shares();
-                    
-                    let has_position_in_bank = deposit_shares.iter().any(|(_, bank_pk)| bank_pk == bank_address)
-                        || liab_shares.iter().any(|(_, bank_pk)| bank_pk == bank_address);
-                    
+                    let (deposit_shares, liab_shares) =
+                        account.get_deposits_and_liabilities_shares();
+
+                    let has_position_in_bank = deposit_shares
+                        .iter()
+                        .any(|(_, bank_pk)| bank_pk == bank_address)
+                        || liab_shares
+                            .iter()
+                            .any(|(_, bank_pk)| bank_pk == bank_address);
+
                     if has_position_in_bank {
                         accounts_with_positions += 1;
-                        
+
                         // Quick health check first
                         match self.quick_health_check(&account) {
                             Ok(health) => {
@@ -339,7 +375,11 @@ impl Liquidator {
                                             }
                                         }
                                         Err(e) => {
-                                            thread_trace!("Failed to process account {:?}: {:?}", account.address, e);
+                                            thread_trace!(
+                                                "Failed to process account {:?}: {:?}",
+                                                account.address,
+                                                e
+                                            );
                                             ERROR_COUNT.inc();
                                         }
                                     }
@@ -350,32 +390,42 @@ impl Liquidator {
                             }
                         }
                     }
-                    
+
                     processed += 1;
                 }
                 Err(err) => {
-                    thread_error!("Failed to get Marginfi account by index {}: {:?}", index, err);
+                    thread_error!(
+                        "Failed to get Marginfi account by index {}: {:?}",
+                        index,
+                        err
+                    );
                     ERROR_COUNT.inc();
                 }
             }
         }
-        
+
         thread_info!("Bank-based evaluation complete: processed {} accounts, found {} accounts with positions in bank {}, {} liquidatable", 
                     processed, accounts_with_positions, bank_address, result.len());
-        
+
         Ok(result)
     }
 
     /// Execute liquidation for a prepared liquidatable account
-    pub fn execute_liquidation(&mut self, prepared_account: &PreparedLiquidatableAccount) -> Result<()> {
+    pub fn execute_liquidation(
+        &mut self,
+        prepared_account: &PreparedLiquidatableAccount,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
-        
-        thread_info!("Executing liquidation for account {} - profit: ${}", 
-                    prepared_account.liquidatee_account.address, 
-                    prepared_account.profit as f64 / 1_000_000.0);
-        
-        let mut stale_swb_oracles: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
-        
+
+        thread_info!(
+            "Executing liquidation for account {} - profit: ${}",
+            prepared_account.liquidatee_account.address,
+            prepared_account.profit as f64 / 1_000_000.0
+        );
+
+        let mut stale_swb_oracles: std::collections::HashSet<Pubkey> =
+            std::collections::HashSet::new();
+
         match self.liquidator_account.liquidate(
             &prepared_account.liquidatee_account,
             &prepared_account.asset_bank,
@@ -387,63 +437,85 @@ impl Liquidator {
             Ok(_) => {
                 let duration = start.elapsed().as_secs_f64();
                 crate::metrics::LIQUIDATION_LATENCY.observe(duration);
-                thread_info!("Successfully liquidated account {} in {:.2}s", 
-                            prepared_account.liquidatee_account.address, duration);
+                thread_info!(
+                    "Successfully liquidated account {} in {:.2}s",
+                    prepared_account.liquidatee_account.address,
+                    duration
+                );
             }
             Err(e) => {
-                thread_error!("Failed to liquidate account {:?}: {:?}", 
-                             prepared_account.liquidatee_account.address, e.error);
+                thread_error!(
+                    "Failed to liquidate account {:?}: {:?}",
+                    prepared_account.liquidatee_account.address,
+                    e.error
+                );
                 crate::metrics::FAILED_LIQUIDATIONS.inc();
                 crate::metrics::ERROR_COUNT.inc();
                 stale_swb_oracles.extend(&e.keys);
             }
         }
-        
+
         // Crank any stale SWB oracles
         if !stale_swb_oracles.is_empty() {
-            thread_info!("Cranking SWB oracles for failed liquidation: {:#?}", stale_swb_oracles);
-            if let Err(err) = self.swb_cranker.crank_oracles(stale_swb_oracles.into_iter().collect()) {
+            thread_info!(
+                "Cranking SWB oracles for failed liquidation: {:#?}",
+                stale_swb_oracles
+            );
+            if let Err(err) = self
+                .swb_cranker
+                .crank_oracles(stale_swb_oracles.into_iter().collect())
+            {
                 thread_error!("Failed to crank SWB oracles: {}", err);
             }
         }
-        
+
         Ok(())
     }
 
     /// Execute multiple liquidations in sequence
-    pub fn execute_liquidations(&mut self, prepared_accounts: Vec<PreparedLiquidatableAccount>) -> Result<()> {
+    pub fn execute_liquidations(
+        &mut self,
+        prepared_accounts: Vec<PreparedLiquidatableAccount>,
+    ) -> Result<()> {
         if prepared_accounts.is_empty() {
             return Ok(());
         }
-        
+
         thread_info!("Executing {} liquidations", prepared_accounts.len());
-        
+
         // Sort by profit (highest first)
         let mut sorted_accounts = prepared_accounts;
         sorted_accounts.sort_by(|a, b| b.profit.cmp(&a.profit));
-        
+
         let mut successful = 0;
         let mut failed = 0;
-        
+
         for prepared_account in sorted_accounts {
             match self.execute_liquidation(&prepared_account) {
                 Ok(_) => successful += 1,
                 Err(e) => {
                     failed += 1;
-                    thread_error!("Failed to execute liquidation for account {}: {:?}", 
-                                 prepared_account.liquidatee_account.address, e);
+                    thread_error!(
+                        "Failed to execute liquidation for account {}: {:?}",
+                        prepared_account.liquidatee_account.address,
+                        e
+                    );
                 }
             }
         }
-        
-        thread_info!("Liquidation execution complete: {} successful, {} failed", successful, failed);
-        
+
+        thread_info!(
+            "Liquidation execution complete: {} successful, {} failed",
+            successful,
+            failed
+        );
+
         // Run rebalancer after liquidations
         if let Err(error) = self.rebalancer.run() {
             thread_error!("Rebalancing failed after liquidations: {:?}", error);
             crate::metrics::ERROR_COUNT.inc();
         }
-        
+
         Ok(())
     }
 
@@ -454,9 +526,13 @@ impl Liquidator {
         let total_accounts = self.cache.marginfi_accounts.len()?;
         let mut processed = 0;
         let max_accounts_to_process = total_accounts; // Process all accounts - reactive system handles performance
-        
-        thread_info!("Starting liquidation evaluation of {} accounts (limited to {} for performance)", total_accounts, max_accounts_to_process);
-        
+
+        thread_info!(
+            "Starting liquidation evaluation of {} accounts (limited to {} for performance)",
+            total_accounts,
+            max_accounts_to_process
+        );
+
         let mut index: usize = 0;
         while index < total_accounts && processed < max_accounts_to_process {
             match self.cache.marginfi_accounts.try_get_account_by_index(index) {
@@ -465,7 +541,7 @@ impl Liquidator {
                         index += 1;
                         continue;
                     }
-                    
+
                     // Quick health check first to avoid expensive processing of healthy accounts
                     match self.quick_health_check(&account) {
                         Ok(health) => {
@@ -505,36 +581,36 @@ impl Liquidator {
             }
             index += 1;
         }
-        
+
         thread_info!("Completed liquidation evaluation: processed {} accounts, found {} liquidatable accounts", processed, result.len());
         Ok(result)
     }
-    
+
     /// Quick health check to avoid processing healthy accounts
     fn quick_health_check(&self, account: &MarginfiAccountWrapper) -> Result<f64> {
         let (deposit_shares, liabs_shares) = account.get_deposits_and_liabilities_shares();
-        
+
         if liabs_shares.is_empty() {
             return Ok(100.0); // No liabilities = healthy
         }
-        
+
         let deposit_values = self.get_value_of_shares(
             deposit_shares,
             &BalanceSide::Assets,
             RequirementType::Maintenance,
         )?;
-        
+
         let liab_values = self.get_value_of_shares(
             liabs_shares,
             &BalanceSide::Liabilities,
             RequirementType::Maintenance,
         )?;
-        
+
         let total_weighted_assets: I80F48 = deposit_values.iter().map(|(v, _)| *v).sum();
         let total_weighted_liabilities: I80F48 = liab_values.iter().map(|(v, _)| *v).sum();
-        
+
         let maintenance_health = total_weighted_assets - total_weighted_liabilities;
-        
+
         if total_weighted_assets == I80F48::ZERO {
             if total_weighted_liabilities == I80F48::ZERO {
                 return Ok(100.0);
@@ -542,7 +618,11 @@ impl Liquidator {
                 return Ok(0.0);
             }
         } else {
-            Ok(maintenance_health.checked_div(total_weighted_assets).unwrap_or(I80F48::ZERO).to_num::<f64>() * 100.0)
+            Ok(maintenance_health
+                .checked_div(total_weighted_assets)
+                .unwrap_or(I80F48::ZERO)
+                .to_num::<f64>()
+                * 100.0)
         }
     }
 
@@ -781,36 +861,40 @@ impl Liquidator {
 
     /// Calculate maximum liquidation capacity using USDC collateral
     /// This allows cross-asset liquidations by using the liquidator's USDC to pay liabilities
-    fn get_max_liquidation_capacity_with_usdc(&self, liab_bank_pk: &Pubkey) -> Result<(I80F48, I80F48)> {
+    fn get_max_liquidation_capacity_with_usdc(
+        &self,
+        liab_bank_pk: &Pubkey,
+    ) -> Result<(I80F48, I80F48)> {
         let lq_account = &self
             .cache
             .marginfi_accounts
             .try_get_account(&self.liquidator_account.liquidator_address)?;
 
         let free_collateral = get_free_collateral(&self.cache, lq_account)?;
-        
+
         // Get the liability bank to determine the token price
         let liab_bank = self.cache.banks.try_get_bank(liab_bank_pk)?;
         let liab_oracle_wrapper = OracleWrapper::build(&self.cache, liab_bank_pk)?;
-        
+
         // Use conservative pricing for liquidation capacity calculation
         let liab_price = liab_oracle_wrapper.get_price_of_type(
             marginfi::state::price::OraclePriceType::TimeWeighted,
             Some(marginfi::state::price::PriceBias::High), // Use high price for conservative estimate
             liab_bank.bank.config.oracle_max_confidence,
         )?;
-        
+
         let token_decimals = liab_bank.bank.mint_decimals as usize;
-        
+
         // Calculate how much of the liability token we can buy with our USDC collateral
         // Apply a safety factor to account for slippage and price volatility
         let safety_factor = I80F48::from_num(0.85); // 15% safety margin
         let max_liab_value_usdc = free_collateral * safety_factor;
-        
+
         // Convert USDC value to liability token amount
         let max_liab_amount_ui = max_liab_value_usdc / liab_price;
-        let max_liab_amount = max_liab_amount_ui * I80F48::from_num(10_u64.pow(token_decimals as u32));
-        
+        let max_liab_amount =
+            max_liab_amount_ui * I80F48::from_num(10_u64.pow(token_decimals as u32));
+
         // Calculate the value in USD for capacity comparison
         let max_liab_value = liab_bank.calc_value(
             &liab_oracle_wrapper,
@@ -818,12 +902,12 @@ impl Liquidator {
             BalanceSide::Liabilities,
             RequirementType::Initial,
         )?;
-        
+
         thread_debug!(
             "Liquidation capacity with USDC: free_collateral={:?}, liab_price={:?}, max_liab_amount={:?}, max_liab_value={:?}",
             free_collateral, liab_price, max_liab_amount, max_liab_value
         );
-        
+
         Ok((max_liab_amount, max_liab_value))
     }
 
@@ -889,7 +973,7 @@ impl Liquidator {
 
         let asset_bank_wrapper = self.cache.banks.try_get_bank(asset_bank_pk)?;
         let asset_oracle_wrapper = OracleWrapper::build(&self.cache, asset_bank_pk)?;
-          let asset_price = asset_oracle_wrapper
+        let asset_price = asset_oracle_wrapper
             .get_price_of_type(OraclePriceType::RealTime, None, 0)?
             .to_num::<f64>();
         if let Some(&declared_value) = self.declared_values.get(&asset_bank_wrapper.bank.mint) {
@@ -916,7 +1000,7 @@ impl Liquidator {
         }
         let liab_bank_wrapper = self.cache.banks.try_get_bank(liab_bank_pk)?;
         let liab_oracle_wrapper = OracleWrapper::build(&self.cache, liab_bank_pk)?;
-          let liab_price = liab_oracle_wrapper
+        let liab_price = liab_oracle_wrapper
             .get_price_of_type(OraclePriceType::RealTime, None, 0)?
             .to_num::<f64>();
         if let Some(&declared_value) = self.declared_values.get(&liab_bank_wrapper.bank.mint) {

@@ -231,6 +231,49 @@ pub fn make_create_ix(
     }
 }
 
+pub fn make_start_flashloan_ix(
+    marginfi_program_id: Pubkey,
+    marginfi_account: Pubkey,
+    signer: Pubkey,
+    end_index: u64,
+) -> Instruction {
+    Instruction {
+        program_id: marginfi_program_id,
+        accounts: marginfi::accounts::LendingAccountStartFlashloan {
+            marginfi_account,
+            authority: signer,
+            ixs_sysvar: solana_sdk::sysvar::instructions::id(),
+        }
+        .to_account_metas(Some(true)),
+        data: marginfi::instruction::LendingAccountStartFlashloan { end_index }.data(),
+    }
+}
+
+pub fn make_end_flashloan_ix(
+    marginfi_program_id: Pubkey,
+    marginfi_account: Pubkey,
+    signer: Pubkey,
+    observation_accounts: Vec<Pubkey>,
+) -> Instruction {
+    let mut accounts = marginfi::accounts::LendingAccountEndFlashloan {
+        marginfi_account,
+        authority: signer,
+    }
+    .to_account_metas(Some(true));
+
+    accounts.extend(
+        observation_accounts
+            .iter()
+            .map(|a| AccountMeta::new_readonly(a.key(), false)),
+    );
+
+    Instruction {
+        program_id: marginfi_program_id,
+        accounts,
+        data: marginfi::instruction::LendingAccountEndFlashloan {}.data(),
+    }
+}
+
 pub fn initialize_marginfi_account(
     rpc_client: &RpcClient,
     marginfi_program_id: Pubkey,

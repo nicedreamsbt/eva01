@@ -84,6 +84,8 @@ pub fn run_liquidator(config: Eva01Config, stop_liquidator: Arc<AtomicBool>) -> 
         &config.general_config.clone(),
         config.general_config.marginfi_group_key,
         config.rebalancer_config.swap_mint,
+        config.rebalancer_config.jup_swap_api_url.clone(),
+        config.rebalancer_config.slippage_bps,
         cache.clone(),
     )?);
 
