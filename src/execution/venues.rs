@@ -31,6 +31,8 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use log::{debug, info};
 use solana_dex_superagg::{DexSuperAggClient, RouteRequest, SwapInstructions};
 
+use super::nds::{NdsAnswer, NdsSource};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Venue {
     Jupiter,
@@ -409,6 +411,9 @@ impl VenueConfig {
 /// A route and how it was found.
 pub struct Routed {
     pub swap: SwapInstructions,
+    /// Whether the local router found it (its route carries no lookup tables, so it may not fit a
+    /// v0 transaction; the caller then asks the venues instead).
+    pub from_nds: bool,
     /// The venues asked, what each answered and how long it took, for the liquidation's timeline.
     pub detail: String,
 }
@@ -420,6 +425,8 @@ pub struct VenueSet<S: QuoteSource> {
     pub jupiter: Option<S>,
     pub titan: Option<S>,
     pub dflow: Option<S>,
+    /// The local router, asked before any venue; `None` when it is off.
+    pub nds: Option<NdsSource>,
     pub limits: std::sync::Arc<VenueLimits>,
     pub config: VenueConfig,
 }
@@ -444,12 +451,41 @@ impl<S: QuoteSource> VenueSet<S> {
 
     /// A route for `request`, for a liquidation expected to earn `profit_usd`.
     pub async fn route(&self, request: &RouteRequest, profit_usd: f64) -> Result<Routed> {
+        self.route_with(request, profit_usd, true).await
+    }
+
+    /// Like [`Self::route`] without asking the local router: for a liquidation whose transaction
+    /// did not fit with its route.
+    pub async fn route_venues_only(&self, request: &RouteRequest, profit_usd: f64) -> Result<Routed> {
+        self.route_with(request, profit_usd, false).await
+    }
+
+    async fn route_with(
+        &self,
+        request: &RouteRequest,
+        profit_usd: f64,
+        use_nds: bool,
+    ) -> Result<Routed> {
         let started = Instant::now();
         let mut notes: Vec<String> = Vec::new();
         let mut failures: Vec<(Venue, String)> = Vec::new();
         let mut left_out = false;
         let mut asked: Vec<Venue> = Vec::new();
         let mut pending: FuturesUnordered<Answer<'_>> = FuturesUnordered::new();
+
+        // The local router first: no round trip and no rate limit, and any route it returns
+        // already clears the floor. A decline or a failure leaves the venues to answer.
+        if let Some(nds) = self.nds.as_ref().filter(|_| use_nds) {
+            match nds.route(request) {
+                Ok(NdsAnswer::Routed(swap, note)) => {
+                    let detail = format!("{note} total_ms={}", started.elapsed().as_millis());
+                    debug!("Route from nds: {detail}");
+                    return Ok(Routed { swap: *swap, from_nds: true, detail });
+                }
+                Ok(NdsAnswer::Declined(note)) => notes.push(note),
+                Err(e) => notes.push(format!("nds failed: {e}")),
+            }
+        }
 
         // Jupiter first, within its pace.
         if self.jupiter.is_some() {
@@ -548,7 +584,7 @@ impl<S: QuoteSource> VenueSet<S> {
             Some((winner, swap)) => {
                 self.limits.note_result(winner, true, None);
                 debug!("Route from {}: {detail}", winner.name());
-                Ok(Routed { swap, detail })
+                Ok(Routed { swap, from_nds: false, detail })
             }
             None => Err(self.no_route(&failures, left_out, &asked, &notes)),
         }
@@ -824,6 +860,7 @@ mod tests {
             jupiter,
             titan,
             dflow: None,
+            nds: None,
             limits: Arc::new(limits()),
             config: VenueConfig {
                 jupiter_wait: ms(600),

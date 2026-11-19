@@ -701,7 +701,7 @@ impl LiquidatorAccount {
         }
 
         let tx = self.compile_tx(&signer_pk, ixs, luts)?;
-        let size = bincode::serialize(&tx)?.len();
+        let size = crate::transaction_limits::wire_bytes(&tx)?.len();
         if size <= MAX_V0_TX_SIZE {
             return Ok(tx);
         }
@@ -762,7 +762,7 @@ impl LiquidatorAccount {
             v1::Message::try_compile_with_config(&signer_pk, ixs, recent_blockhash, config)
                 .map_err(|e| anyhow!("{e:?}"))?;
         let tx = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&self.signer])?;
-        let size = bincode::serialize(&tx)?.len();
+        let size = crate::transaction_limits::wire_bytes(&tx)?.len();
         if size > MAX_V1_TX_SIZE {
             return Err(anyhow!(
                 "transaction is {} bytes (max {})",

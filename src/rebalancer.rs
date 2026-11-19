@@ -335,6 +335,7 @@ impl Rebalancer {
                 single(false, false, true),
                 liquidation_config.dflow.is_some(),
             )?,
+            nds: crate::execution::nds::NdsSource::from_env(),
             limits: venue_limits.clone(),
             config: VenueConfig::from_env(),
         });

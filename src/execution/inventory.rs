@@ -15,7 +15,7 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
-use log::{debug, info};
+use log::{debug, info, warn};
 use solana_dex_superagg::{DexSuperAggClient, RouteRequest};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -222,13 +222,38 @@ impl InventoryStrategy {
             "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
             asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount
         );
-        let tx = self.liquidator_account.build_liquidate_tx(
+        let built = self.liquidator_account.build_liquidate_tx(
             intent,
             intent.asset_amount,
             intent.liab_amount,
             Some(&swap),
             landing,
-        )?;
+        );
+        // The local router's route carries no lookup tables, so with the liquidation's own
+        // instructions it may not fit a v0 transaction. The venues' routes come with theirs.
+        let tx = match built {
+            Ok(tx) => tx,
+            Err(e) if routed.from_nds => {
+                warn!(
+                    "InventoryStrategy: the transaction with the nds route did not build ({e:#}); asking the venues"
+                );
+                let started = Instant::now();
+                let fallback = self.tokio_rt.block_on(async {
+                    let _permit = self.dex_gate.acquire().await?;
+                    self.venues.route_venues_only(&request, profit_usd).await
+                })?;
+                venues::log_routed(intent.attempt_id, &fallback, started.elapsed());
+                trace::note("quote_venue", format!("{:?}", fallback.swap.aggregator));
+                self.liquidator_account.build_liquidate_tx(
+                    intent,
+                    intent.asset_amount,
+                    intent.liab_amount,
+                    Some(&fallback.swap),
+                    landing,
+                )?
+            }
+            Err(e) => return Err(e),
+        };
         // Over RPC this is its only check: the executor sends it without preflight. A bundled one
         // isn't simulated at all: a bundle that fails doesn't land, and one behind a push relies
         // on prices the chain doesn't hold yet.

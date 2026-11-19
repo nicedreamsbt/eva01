@@ -84,3 +84,48 @@ mod tests {
         assert_eq!(MAX_LOADED_ACCOUNTS_DATA, 64 * 1024 * 1024);
     }
 }
+
+/// The bytes of `tx` as they go on the wire. A v1 transaction has its own layout (version byte
+/// first, signatures last) that only wincode writes, as the SDK's own RPC client does; bincode
+/// writes the older layout, which a node cannot read as v1. For legacy and v0 the two agree.
+pub fn wire_bytes(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+) -> anyhow::Result<Vec<u8>> {
+    wincode::serialize(tx).map_err(|e| anyhow::anyhow!("serializing the transaction: {e}"))
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::Keypair;
+    use solana_message::{v1, Hash, VersionedMessage};
+    use solana_pubkey::Pubkey;
+    use solana_signer::Signer;
+    use solana_transaction::versioned::VersionedTransaction;
+
+    #[test]
+    fn a_v1_transaction_is_written_in_its_own_layout() {
+        let signer = Keypair::new();
+        let ix = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new(signer.pubkey(), true)],
+            data: vec![1, 2, 3],
+        };
+        let config = v1::TransactionConfig {
+            priority_fee: Some(1_000),
+            compute_unit_limit: Some(200_000),
+            loaded_accounts_data_size_limit: Some(1_000_000),
+            ..v1::TransactionConfig::empty()
+        };
+        let message =
+            v1::Message::try_compile_with_config(&signer.pubkey(), &[ix], Hash::new_unique(), config)
+                .unwrap();
+        let tx =
+            VersionedTransaction::try_new(VersionedMessage::V1(message), &[&signer]).unwrap();
+        let wire = wire_bytes(&tx).unwrap();
+        assert_eq!(wire[0], 0x81, "a v1 transaction starts with its version byte");
+        assert_ne!(wire, bincode::serialize(&tx).unwrap(), "bincode writes another layout");
+        assert!(wire.len() <= MAX_V1_TX_SIZE);
+    }
+}

@@ -9,6 +9,11 @@ pretty_logs = []
 network-mainnet = ["marginfi/mainnet-beta", "marginfi_type_crate/mainnet-beta"]
 network-staging = ["marginfi/staging", "marginfi_type_crate/staging"]
 idl-build = []
+# Ask a local nicedreamswap daemon for routes before the venues (Unix only; see execution/nds.rs).
+nds = ["dep:nds-client"]
+
+[target.'cfg(unix)'.dependencies]
+nds-client = { git = "https://github.com/nicedreamsbt/nicedreamswap", rev = "09db31be4d9e12c912607397ca2f75c733197628", optional = true }
 
 [dependencies]
 solana-account = { version = "4", features = ["bincode"] }
@@ -33,7 +38,8 @@ solana-packet = "=4.2.0"
 solana-native-token = "=3.0.0"
 # The version the marginfi program calls `Rent::get()` through; see utils/rent_sysvar.rs.
 solana-sysvar = "=3.1.1"
-solana-transaction = { version = "4", features = ["serde"] }
+solana-transaction = { version = "4", features = ["serde", "wincode"] }
+wincode = "0.5.5"
 spl-associated-token-account = { version = "8.0.0", default-features = false, features = ["no-entrypoint"] }
 spl-token = "9.0.0"
 

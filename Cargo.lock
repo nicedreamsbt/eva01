@@ -1766,6 +1766,7 @@ dependencies = [
  "log",
  "marginfi",
  "marginfi-type-crate",
+ "nds-client",
  "pyth-solana-receiver-sdk",
  "pythnet-sdk",
  "rayon",
@@ -3180,6 +3181,27 @@ dependencies = [
  "security-framework 2.11.1",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "nds-client"
+version = "0.1.0"
+source = "git+https://github.com/nicedreamsbt/nicedreamswap?rev=09db31be4d9e12c912607397ca2f75c733197628#09db31be4d9e12c912607397ca2f75c733197628"
+dependencies = [
+ "anyhow",
+ "nds-proto",
+ "serde_json",
+ "solana-pubkey 4.2.0",
+]
+
+[[package]]
+name = "nds-proto"
+version = "0.1.0"
+source = "git+https://github.com/nicedreamsbt/nicedreamswap?rev=09db31be4d9e12c912607397ca2f75c733197628#09db31be4d9e12c912607397ca2f75c733197628"
+dependencies = [
+ "bincode",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

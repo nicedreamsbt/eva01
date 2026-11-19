@@ -9,6 +9,7 @@
 pub mod activity;
 pub mod executor;
 pub mod inventory;
+pub mod nds;
 pub mod queue;
 pub mod reservations;
 pub mod trace;
