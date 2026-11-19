@@ -56,8 +56,10 @@ use solana_keypair::Keypair;
 use solana_signer::Signer;
 
 use super::{
-    inventory::WalletClaimed, queue::ExecutionQueue, Claim, ExecutionPlan, Landing,
-    LiquidationStrategy, Sandwich,
+    inventory::WalletClaimed,
+    queue::ExecutionQueue,
+    trace::{self, AttemptTrace, Stage},
+    Claim, ExecutionPlan, Landing, LiquidationStrategy, Sandwich,
 };
 
 /// What `try_execute` did. `Settling` means the bundle was accepted and a watcher owns the
@@ -276,6 +278,28 @@ fn nothing_sent(e: &anyhow::Error) -> bool {
     e.downcast_ref::<NotSent>().is_some() || e.downcast_ref::<NoRelay>().is_some()
 }
 
+/// What became of a failed attempt, in a word for its timeline.
+fn outcome_of(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<LostRace>().is_some() {
+        "lost"
+    } else if nothing_sent(e) {
+        "not_sent"
+    } else if e.downcast_ref::<PushFailure>().is_some() {
+        "push_failed"
+    } else if e.downcast_ref::<BuildFailure>().is_some() {
+        "build_failed"
+    } else {
+        "failed"
+    }
+}
+
+/// The first line of an error, cut short, quoted, for a timeline line.
+fn short_error(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    let line = text.lines().next().unwrap_or_default();
+    format!("{:?}", line.chars().take(120).collect::<String>())
+}
+
 /// What Sender answered, without its message.
 #[derive(Clone, Copy)]
 enum SenderSendKind {
@@ -401,6 +425,8 @@ struct SettlementJob {
     /// Push or refresh sits ahead of the liquidation, so a simulation of it alone does not explain a loss.
     behind_others: bool,
     bundle: Vec<VersionedTransaction>,
+    /// The attempt's stage timings, which the watcher completes when the bundle lands or is lost.
+    trace: Arc<AttemptTrace>,
 }
 
 /// A bundle the relays accepted, ready for the settlement watcher.
@@ -579,19 +605,26 @@ impl Executor {
             alone,
             behind_others,
             bundle,
+            trace,
         } = job;
-        let result =
-            match self.landed_before_expiry(attempt_id, &liquidation_sig, &blockhash, &watch) {
-                Ok(Some(slot)) => {
-                    self.landed_slots
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(attempt_id, slot);
-                    Ok(())
-                }
-                Ok(None) => Err(LostRace(String::new()).into()),
-                Err(e) => Err(e),
-            };
+        let result = match self.landed_before_expiry(
+            attempt_id,
+            &liquidation_sig,
+            &blockhash,
+            &watch,
+            &trace,
+        ) {
+            Ok(Some(slot)) => {
+                trace.mark(Stage::Landed);
+                self.landed_slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(attempt_id, slot);
+                Ok(())
+            }
+            Ok(None) => Err(LostRace(String::new()).into()),
+            Err(e) => Err(e),
+        };
         // A sandwich claims no wallet tokens, and a bundle that never went out spent none.
         let sent = !result.as_ref().is_err_and(|e| {
             e.downcast_ref::<NoRelay>().is_some() || e.downcast_ref::<NotSent>().is_some()
@@ -625,6 +658,11 @@ impl Executor {
             }
             Err(_) => {}
         }
+        let outcome = match &result {
+            Ok(()) => "landed",
+            Err(e) => outcome_of(e),
+        };
+        trace.report(attempt_id, &liquidatee, outcome);
         result
     }
 
@@ -654,6 +692,11 @@ impl Executor {
             info!(
                 "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason=backed_off",
                 intent.attempt_id, intent.liquidatee_account.address
+            );
+            intent.trace.report(
+                intent.attempt_id,
+                &intent.liquidatee_account.address,
+                "backed_off",
             );
             return Ok(AttemptOutcome::Finished);
         }
@@ -686,6 +729,8 @@ impl Executor {
                 intent.attempt_id, intent.liquidatee_account.address, oracle_state
             );
         }
+        // The stages passed on the way (the plan built, the send) are marked on this attempt's trace.
+        let _trace = trace::enter(intent.trace.clone());
         let started = Instant::now();
         let result = self.try_execute_inner(strategy, intent);
         match &result {
@@ -707,6 +752,27 @@ impl Executor {
                 intent.liquidatee_account.address,
                 started.elapsed().as_millis()
             ),
+        }
+        // The timeline ends here unless a bundle was accepted: the watcher ends that one when it
+        // lands or is lost.
+        let account = intent.liquidatee_account.address;
+        match &result {
+            Ok(AttemptOutcome::Settling) => {}
+            Ok(AttemptOutcome::Finished) => {
+                let outcome = if intent.trace.landed() {
+                    "landed"
+                } else {
+                    "skipped"
+                };
+                intent.trace.report(intent.attempt_id, &account, outcome);
+            }
+            Err(e) => {
+                let outcome = outcome_of(e);
+                if outcome == "failed" {
+                    intent.trace.note("error", short_error(e));
+                }
+                intent.trace.report(intent.attempt_id, &account, outcome);
+            }
         }
         result
     }
@@ -869,6 +935,9 @@ impl Executor {
                     liquidatee,
                     tx.signatures.first().map(ToString::to_string)
                 );
+                trace::mark(Stage::Planned);
+                trace::note("plan", "sandwich");
+                trace::note("landing", "rpc");
                 let result = self.send_over_rpc(&tx, "Sandwich", Preflight::Skip);
                 self.note_result(&liquidatee, &result);
                 finished(result)
@@ -1031,6 +1100,9 @@ impl Executor {
             liquidatee,
             tx.signatures.first().map(ToString::to_string)
         );
+        trace::mark(Stage::Planned);
+        trace::note("plan", "wallet-funded");
+        trace::note("landing", "rpc");
         let result = self.send_over_rpc(&tx, "Wallet-funded", preflight);
         self.note_result(liquidatee, &result);
         self.refresh_wallet_balances();
@@ -1272,6 +1344,11 @@ impl Executor {
             sender_bundle.is_some()
         );
 
+        trace::mark(Stage::Planned);
+        trace::note("plan", kind);
+        trace::note("tip_lamports", tip);
+        trace::note("push_txs", push.map_or(0, |push| push.txs.len()));
+        trace::note("sender_copy", sender_bundle.is_some());
         // The request slot is taken only now, everything built, so none is held while quoting.
         // With Sender taking the bundle too, it doesn't wait for one (unless Sender refuses).
         // Whether the block engine was skipped as down, decided once, for what a refusal means.
@@ -1319,6 +1396,7 @@ impl Executor {
                     alone,
                     behind_others: push.is_some() || behind_refresh,
                     bundle,
+                    trace: intent.trace.clone(),
                 };
                 match self.enqueue_settlement(job) {
                     Ok(()) => Ok(AttemptOutcome::Settling),
@@ -1495,6 +1573,7 @@ impl Executor {
         if jito_id.is_none() && !jito_uncertain && !sender_in_flight {
             return Ok(BundleOutcome::Refused);
         }
+        trace::mark(Stage::Submitted);
         info!(
             "LIQUIDATION_BUNDLE_ACCEPTED attempt_id={} bundle_id={} sender={} liquidation_signature={} txs_before_liquidation={}",
             attempt_id,
@@ -1529,6 +1608,7 @@ impl Executor {
         sig: &Signature,
         blockhash: &Hash,
         watch: &OwnedWatch,
+        trace: &AttemptTrace,
     ) -> Result<Option<u64>> {
         let started = Instant::now();
         let mut last_inflight_check = Instant::now();
@@ -1555,6 +1635,8 @@ impl Executor {
         watched.extend(watch.sender_tip);
         let landed = |slot: u64, via_sender: bool| {
             let via = if via_sender { Path::Sender } else { Path::Jito };
+            trace.note("via", via);
+            trace.note("landed_slot", slot);
             info!(
                 "LIQUIDATION_BUNDLE_LANDED attempt_id={attempt_id} liquidation_signature={sig} slot={slot} via={via} elapsed_ms={}",
                 started.elapsed().as_millis()
@@ -1798,6 +1880,7 @@ impl Executor {
         let sig = self
             .send_with_resend(tx, preflight)
             .map_err(|e| anyhow!("{label} send failed: {e}"))?;
+        trace::mark(Stage::Landed);
         info!("{label} tx confirmed: {sig}");
         Ok(())
     }
@@ -1852,6 +1935,7 @@ impl Executor {
             }
         };
 
+        trace::mark(Stage::Submitted);
         let started = Instant::now();
         let mut last_sent = Instant::now();
         let mut resends = 0u32;

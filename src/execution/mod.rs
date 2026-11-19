@@ -11,6 +11,7 @@ pub mod executor;
 pub mod inventory;
 pub mod queue;
 pub mod reservations;
+pub mod trace;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;

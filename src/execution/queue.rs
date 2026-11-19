@@ -308,6 +308,7 @@ mod tests {
             push: None,
             without_push: None,
             sandwich_pair: None,
+            trace: crate::execution::trace::AttemptTrace::untraced(),
         }
     }
 
@@ -505,5 +506,6 @@ pub(crate) fn intent_for_test(address: Pubkey, profit: i32) -> PreparedLiquidata
         push: None,
         without_push: None,
         sandwich_pair: None,
+        trace: crate::execution::trace::AttemptTrace::untraced(),
     }
 }

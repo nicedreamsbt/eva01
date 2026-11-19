@@ -39,7 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::execution::Landing;
+use crate::execution::{trace::AttemptTrace, Landing};
 use crate::juplend_ixs::juplend_underlying_amount;
 use crate::transaction_limits::{
     bundle_cu_price, priority_fee_lamports, MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA,
@@ -123,9 +123,21 @@ pub struct PreparedLiquidatableAccount {
     /// seizes from a Kamino or JupLend bank, whose withdrawal leaves less room for the route, and a
     /// native pair earns nearly as much (`is_better_pair`).
     pub sandwich_pair: Option<LiquidationPair>,
+    /// Which detection path queued this liquidation and how long each stage after it took, shared by
+    /// every copy of the intent (the sandwich pair, the push-less alternative).
+    pub trace: Arc<AttemptTrace>,
 }
 
 impl PreparedLiquidatableAccount {
+    /// This liquidation, and the alternative kept beside it, carrying `trace`.
+    pub fn with_trace(mut self, trace: Arc<AttemptTrace>) -> Self {
+        if let Some(unpushed) = self.without_push.take() {
+            self.without_push = Some(Box::new(unpushed.with_trace(trace.clone())));
+        }
+        self.trace = trace;
+        self
+    }
+
     /// This liquidation, and the smaller one kept beside it, logged under `attempt_id`.
     pub fn for_attempt(mut self, attempt_id: u64) -> Self {
         self.attempt_id = attempt_id;
@@ -455,6 +467,7 @@ impl LiquidatorAccount {
             push: None,
             without_push: None,
             sandwich_pair: None,
+            trace: AttemptTrace::untraced(),
         };
         let (ixs, _, record) =
             self.liquidation_ixs(&intent, I80F48::ONE, I80F48::ONE, None, true)?;

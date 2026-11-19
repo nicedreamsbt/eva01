@@ -291,7 +291,16 @@ impl Ingest {
         }
         if self.hot_mode == HotMode::On {
             // The evaluated accounts' older intents are replaced, or withdrawn when they are no
-            // longer liquidatable.
+            // longer liquidatable. Each liquidation carries the path that found it to the end of its
+            // attempt.
+            let liquidations = liquidations
+                .into_iter()
+                .map(|intent| {
+                    let trace =
+                        AttemptTrace::new(DetectionPath::Hot, changes.oldest, intent.attempt_id);
+                    intent.with_trace(trace)
+                })
+                .collect();
             self.queue.offer(&affected, liquidations);
         }
     }

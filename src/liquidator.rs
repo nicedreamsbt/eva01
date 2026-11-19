@@ -14,6 +14,7 @@ use crate::{
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
+        trace::{self, AttemptTrace, DetectionPath, Stage},
     },
     geyser::{AccountType, GeyserUpdate},
     health_watch::{self, HealthWatch, Watch, WatchedPosition},
@@ -1242,6 +1243,21 @@ impl Liquidator {
                 liquidations
                     .retain(|intent| !skip_queue.contains(&intent.liquidatee_account.address));
                 let liquidatable = liquidations.len();
+                // Which path found each liquidation travels with it to the end of its attempt.
+                let path = if full {
+                    DetectionPath::Sweep
+                } else if oldest.is_none() {
+                    DetectionPath::Startup
+                } else {
+                    DetectionPath::Background
+                };
+                let liquidations: Vec<PreparedLiquidatableAccount> = liquidations
+                    .into_iter()
+                    .map(|intent| {
+                        let trace = AttemptTrace::new(path, oldest, intent.attempt_id);
+                        intent.with_trace(trace)
+                    })
+                    .collect();
                 if let Some(oldest) = oldest {
                     let queued_at = Instant::now();
                     for intent in &liquidations {
@@ -1323,6 +1339,9 @@ impl Liquidator {
         );
         self.scan_stats = ScanStats::new();
         self.report_hot_path();
+        for line in trace::take_summary() {
+            info!("{line}");
+        }
     }
 
     /// The update path's minute: how big the hot list is, how long its checks took, how much earlier
@@ -1613,20 +1632,29 @@ fn attempt_liquidation(
     activity: &LiquidationActivity,
 ) -> AttemptRelease {
     let liquidatee = intent.liquidatee_account.address;
+    intent.trace.mark(Stage::Taken);
     // The intent was sized on the state at evaluation time. By now another liquidator may have
     // taken a chunk of the account or prices may have moved, so it is re-sized on the current
     // state and dropped if it is no longer worth it, instead of sending a transaction the program
     // would reject.
     // One id for the whole attempt: the re-evaluation sizes it afresh but it is the same attempt.
-    let fresh = evaluator
-        .re_evaluate(&liquidatee)
-        .map(|fresh| fresh.map(|fresh| fresh.for_attempt(intent.attempt_id)));
+    let fresh = evaluator.re_evaluate(&liquidatee).map(|fresh| {
+        fresh.map(|fresh| {
+            fresh
+                .for_attempt(intent.attempt_id)
+                .with_trace(intent.trace.clone())
+        })
+    });
+    intent.trace.mark(Stage::Evaluated);
     match fresh {
         Ok(Some(fresh)) if executor.is_on_hold(&fresh).unwrap_or(false) => {
             info!(
                 "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason=on_hold",
                 fresh.attempt_id, liquidatee
             );
+            intent
+                .trace
+                .report(intent.attempt_id, &liquidatee, "on_hold");
         }
         Ok(Some(fresh)) => {
             // The sandwich takes its own pair when the main one seizes from Kamino or JupLend.
@@ -1641,8 +1669,8 @@ fn attempt_liquidation(
                     )
                 },
             );
-            info!("LIQUIDATION_QUEUE attempt_id={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
-                fresh.attempt_id, liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
+            info!("LIQUIDATION_QUEUE attempt_id={} path={} account={} queue_delay_ms={} asset_bank={} liab_bank={} estimated_repay_usd={:.4} estimated_profit_usd={:.4} binding_cap={} push_feed_count={} sandwich_pair={}",
+                fresh.attempt_id, fresh.trace.path.as_str(), liquidatee, queued_at.elapsed().as_millis(), fresh.asset_bank,
                 fresh.liab_bank, fresh.estimated_repay_usd, fresh.profit.to_num::<f64>(), fresh.binding_cap, fresh.push.as_ref().map_or(0, |push| push.feeds.len()), sandwich);
             queue.resized(&liquidatee, fresh.profit);
             let mut attempt = activity.attempt(liquidatee);
@@ -1668,14 +1696,24 @@ fn attempt_liquidation(
                 }
             }
         }
-        Ok(None) => info!(
-            "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=no_longer_liquidatable elapsed_since_queue_ms={}",
-            intent.attempt_id, liquidatee, queued_at.elapsed().as_millis()
-        ),
-        Err(e) => error!(
-            "LIQUIDATION_REEVALUATION_FAILURE attempt_id={} account={} error={:#}",
-            intent.attempt_id, liquidatee, e
-        ),
+        Ok(None) => {
+            info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=no_longer_liquidatable elapsed_since_queue_ms={}",
+                intent.attempt_id, liquidatee, queued_at.elapsed().as_millis()
+            );
+            intent
+                .trace
+                .report(intent.attempt_id, &liquidatee, "no_longer_liquidatable");
+        }
+        Err(e) => {
+            error!(
+                "LIQUIDATION_REEVALUATION_FAILURE attempt_id={} account={} error={:#}",
+                intent.attempt_id, liquidatee, e
+            );
+            intent
+                .trace
+                .report(intent.attempt_id, &liquidatee, "reevaluation_failed");
+        }
     }
     AttemptRelease::Finished { landed_slot: None }
 }
@@ -2049,6 +2087,7 @@ impl Evaluator {
             push,
             without_push,
             sandwich_pair,
+            trace: AttemptTrace::untraced(),
         })))
     }
 
