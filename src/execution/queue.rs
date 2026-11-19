@@ -532,3 +532,29 @@ mod tests {
         assert!(queue.take().is_none());
     }
 }
+
+#[cfg(test)]
+pub(crate) fn intent_for_test(address: Pubkey, profit: i32) -> PreparedLiquidatableAccount {
+    use crate::wrappers::marginfi_account::{MarginfiAccountWrapper, ObservationAccounts};
+    use fixed::types::I80F48;
+    PreparedLiquidatableAccount {
+        attempt_id: 0,
+        liquidatee_account: MarginfiAccountWrapper::new(address, bytemuck::Zeroable::zeroed()),
+        observation_accounts: ObservationAccounts {
+            observation_accounts: vec![],
+            bank_pks: vec![],
+            kamino_reserves: Default::default(),
+            juplend_states: Default::default(),
+        },
+        asset_bank: Pubkey::default(),
+        liab_bank: Pubkey::default(),
+        asset_amount: I80F48::ONE,
+        liab_amount: I80F48::ONE,
+        profit: I80F48::from_num(profit),
+        estimated_repay_usd: profit as f64,
+        binding_cap: "test",
+        push: None,
+        without_push: None,
+        sandwich_pair: None,
+    }
+}
