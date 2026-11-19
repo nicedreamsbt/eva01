@@ -15,7 +15,7 @@
 //! connection delivers it first.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -104,7 +104,17 @@ struct Metadata {
 enum StreamError {
     /// Hermes refused the API key.
     Rejected(StatusCode),
+    /// The key's grants don't cover this feed; Hermes refuses the whole request for it.
+    NotEntitled([u8; 32]),
     Other(anyhow::Error),
+}
+
+/// The feed a `Not entitled: feed <id> (…)` refusal names. Hermes refuses a request outright when
+/// any one of its feeds is outside the key's grants, naming one feed at a time.
+fn not_entitled_feed(body: &str) -> Option<[u8; 32]> {
+    let rest = body.split("Not entitled: feed ").nth(1)?;
+    let id: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    parse_feed_id(&id).ok()
 }
 
 impl From<anyhow::Error> for StreamError {
@@ -122,6 +132,8 @@ pub struct HermesStream {
     stop: Arc<AtomicBool>,
     /// The sponsored push feed each streamed feed id is written to.
     feeds: HashMap<[u8; 32], Pubkey>,
+    /// Feeds the key isn't entitled to, left out of the request so the rest still stream.
+    denied: Mutex<HashSet<[u8; 32]>>,
     /// The newest publish time applied per feed, so a price both connections deliver is applied
     /// (and its accounts re-evaluated) once.
     applied: Mutex<HashMap<[u8; 32], i64>>,
@@ -165,6 +177,7 @@ impl HermesStream {
             updates,
             stop,
             feeds,
+            denied: Mutex::new(HashSet::new()),
             applied: Mutex::new(HashMap::new()),
         })
     }
@@ -207,6 +220,21 @@ impl HermesStream {
             let connected = Instant::now();
             let mut delivered = false;
             match self.stream(&mut delivered) {
+                Err(StreamError::NotEntitled(feed)) => {
+                    // Leave that feed out and ask again at once for the rest.
+                    let first = self
+                        .denied
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(feed);
+                    if first {
+                        warn!(
+                            "HermesStream: PYTH_API_KEY is not entitled to feed 0x{}; streaming the others without it",
+                            hex_encode(&feed)
+                        );
+                    }
+                    continue;
+                }
                 Err(StreamError::Rejected(status)) => {
                     // A key Hermes refuses won't start working on a retry; say so once and keep
                     // trying quietly, in case it is fixed without a restart.
@@ -237,11 +265,16 @@ impl HermesStream {
 
     /// Streams until the connection ends; `delivered` is set once a price event was read.
     fn stream(&self, delivered: &mut bool) -> std::result::Result<(), StreamError> {
+        let denied = self.denied.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let ids: String = self
             .feeds
             .keys()
+            .filter(|id| !denied.contains(*id))
             .map(|id| format!("ids[]=0x{}&", hex_encode(id)))
             .collect();
+        if ids.is_empty() {
+            return Err(anyhow!("the key is entitled to none of the feeds").into());
+        }
         let url = format!(
             "{}/v2/updates/price/stream?{}parsed=true&encoding=base64",
             self.hermes_url.trim_end_matches('/'),
@@ -255,7 +288,11 @@ impl HermesStream {
         let response = request.send().map_err(|e| anyhow!(e.without_url()))?;
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(StreamError::Rejected(status));
+            let body = response.text().unwrap_or_default();
+            return Err(match not_entitled_feed(&body) {
+                Some(feed) => StreamError::NotEntitled(feed),
+                None => StreamError::Rejected(status),
+            });
         }
         let response = response
             .error_for_status()
@@ -404,6 +441,15 @@ mod tests {
     use solana_clock::Clock;
     use std::{collections::HashSet, sync::Mutex};
 
+    #[test]
+    fn a_refusal_names_the_feed_the_key_is_not_entitled_to() {
+        let id = "b43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2";
+        let body = format!("Not entitled: feed {id} (no grant accepts this feed (asset type 'crypto'))");
+        assert_eq!(not_entitled_feed(&body), Some(parse_feed_id(id).unwrap()));
+        assert_eq!(not_entitled_feed("Forbidden"), None);
+        assert_eq!(not_entitled_feed("Not entitled: feed zz"), None);
+    }
+
     fn update(publish_time: i64, price: &str) -> ParsedUpdate {
         let quote = |value: &str| HermesPrice {
             price: value.to_string(),
@@ -444,6 +490,7 @@ mod tests {
             updates: tx,
             stop: Arc::new(AtomicBool::new(false)),
             feeds: HashMap::from([(feed, oracle)]),
+            denied: Mutex::new(HashSet::new()),
             applied: Mutex::new(HashMap::new()),
         };
 
