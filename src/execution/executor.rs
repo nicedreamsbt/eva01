@@ -22,13 +22,14 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
+use crossbeam::channel::{Receiver, Sender};
 use fixed::types::I80F48;
 use fixed_macro::types::I80F48;
 use log::{debug, info, warn};
@@ -92,6 +93,12 @@ const BLOCKHASH_CHECK_EVERY: u32 = 8;
 
 /// The most a bundle is watched, whatever the RPC answers.
 const WATCH_MAX_WAIT: Duration = Duration::from_secs(45);
+
+/// Threads watching accepted bundles, each blocked on one bundle until it lands or is lost: as many
+/// as bundles can plausibly be in flight at once (a Jito key admits about twenty sends a second,
+/// each settled within seconds), so one bundle's wait never holds up another account's release.
+/// Idle watchers cost nothing; a busy one polls the RPC four times a second.
+const SETTLEMENT_WATCHERS: usize = 32;
 
 /// Polls of the liquidation's signature, after an unconfirmed bundle, this far apart.
 const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -474,7 +481,7 @@ pub struct Executor {
     wallet_min_profit_share: I80F48,
     /// Accepted bundles waiting for the settlement watcher. `None` until it is started, and again
     /// after it is stopped; a send then settles on the worker, as before.
-    settle_tx: Mutex<Option<mpsc::Sender<SettlementJob>>>,
+    settle_tx: Mutex<Option<Sender<SettlementJob>>>,
     /// Set on shutdown so a watch in progress stops polling and releases the account.
     settle_stop: AtomicBool,
 }
@@ -501,43 +508,47 @@ impl Executor {
         }
     }
 
-    /// Starts the thread that watches accepted bundles and releases their accounts. One watcher;
-    /// starting again replaces the channel and the previous thread exits when it next receives.
+    /// Starts the threads that watch accepted bundles and release their accounts. A watch blocks
+    /// for as long as its bundle is in flight (up to [`WATCH_MAX_WAIT`]), so there are as many
+    /// watchers as attempts that can be in flight at once: one bundle's wait never holds up another
+    /// account's release. Starting again replaces the channel; the previous threads exit once their
+    /// channel is dropped and drained.
     pub fn start_settlement(
         self: &Arc<Self>,
         queue: Arc<ExecutionQueue>,
-    ) -> thread::JoinHandle<()> {
-        let (tx, rx) = mpsc::channel();
-        *self
-            .settle_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    ) -> Vec<thread::JoinHandle<()>> {
+        let (tx, rx) = crossbeam::channel::unbounded();
+        *self.settle_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
         self.settle_stop.store(false, Ordering::SeqCst);
-        let executor = Arc::clone(self);
-        thread::Builder::new()
-            .name("settlement".into())
-            .spawn(move || executor.watch_settlements(queue, rx))
-            .expect("settlement watcher thread")
+        (0..SETTLEMENT_WATCHERS)
+            .map(|index| {
+                let executor = Arc::clone(self);
+                let queue = Arc::clone(&queue);
+                let rx = rx.clone();
+                thread::Builder::new()
+                    .name(format!("settlement-{index}"))
+                    .spawn(move || executor.watch_settlements(queue, rx))
+                    .expect("settlement watcher thread")
+            })
+            .collect()
     }
 
-    /// Drops the job channel and asks a watch in progress to stop. The caller joins the thread.
+    /// Drops the job channel and asks a watch in progress to stop. The caller joins the threads.
     pub fn stop_settlement(&self) {
         self.settle_stop.store(true, Ordering::SeqCst);
-        *self
-            .settle_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.settle_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    fn enqueue_settlement(&self, job: SettlementJob) -> Result<(), SettlementJob> {
+    /// Hands `job` to a watcher; gives it back when there is none.
+    fn enqueue_settlement(&self, job: SettlementJob) -> Result<(), Box<SettlementJob>> {
         let guard = self.settle_tx.lock().unwrap_or_else(|e| e.into_inner());
         let Some(tx) = guard.as_ref() else {
-            return Err(job);
+            return Err(Box::new(job));
         };
-        tx.send(job).map_err(|sent| sent.0)
+        tx.send(job).map_err(|sent| Box::new(sent.into_inner()))
     }
 
-    fn watch_settlements(&self, queue: Arc<ExecutionQueue>, rx: mpsc::Receiver<SettlementJob>) {
+    fn watch_settlements(&self, queue: Arc<ExecutionQueue>, rx: Receiver<SettlementJob>) {
         while let Ok(job) = rx.recv() {
             let liquidatee = job.liquidatee;
             let attempt_id = job.attempt_id;
@@ -569,22 +580,18 @@ impl Executor {
             behind_others,
             bundle,
         } = job;
-        let result = match self.landed_before_expiry(
-            attempt_id,
-            &liquidation_sig,
-            &blockhash,
-            &watch,
-        ) {
-            Ok(Some(slot)) => {
-                self.landed_slots
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(attempt_id, slot);
-                Ok(())
-            }
-            Ok(None) => Err(LostRace(String::new()).into()),
-            Err(e) => Err(e),
-        };
+        let result =
+            match self.landed_before_expiry(attempt_id, &liquidation_sig, &blockhash, &watch) {
+                Ok(Some(slot)) => {
+                    self.landed_slots
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(attempt_id, slot);
+                    Ok(())
+                }
+                Ok(None) => Err(LostRace(String::new()).into()),
+                Err(e) => Err(e),
+            };
         // A sandwich claims no wallet tokens, and a bundle that never went out spent none.
         let sent = !result.as_ref().is_err_and(|e| {
             e.downcast_ref::<NoRelay>().is_some() || e.downcast_ref::<NotSent>().is_some()
@@ -1316,7 +1323,7 @@ impl Executor {
                 match self.enqueue_settlement(job) {
                     Ok(()) => Ok(AttemptOutcome::Settling),
                     // No watcher (tests, or shutdown): settle on this thread, as before.
-                    Err(job) => finished(self.finish_job(job)),
+                    Err(job) => finished(self.finish_job(*job)),
                 }
             }
         }
@@ -1502,10 +1509,7 @@ impl Executor {
             liquidation_sig,
             blockhash,
             watch: OwnedWatch {
-                jito_bundle_id: jito_id
-                    .as_ref()
-                    .filter(|id| id.as_str() != "0x0")
-                    .cloned(),
+                jito_bundle_id: jito_id.as_ref().filter(|id| id.as_str() != "0x0").cloned(),
                 jito_uncertain,
                 jito_absent: jito_id.is_none() && !jito_uncertain,
                 sender_tip,
@@ -2220,7 +2224,7 @@ mod tests {
             "handing the account to the watcher does not wait"
         );
         queue.offer(&[address], vec![intent_for_test(address, 4)]);
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let second = thread::spawn({
             let queue = Arc::clone(&queue);
             move || {
@@ -2244,10 +2248,17 @@ mod tests {
     fn the_settlement_watcher_exits_when_its_channel_is_dropped() {
         let executor = Arc::new(executor());
         let queue = Arc::new(ExecutionQueue::new(Duration::ZERO));
-        let handle = executor.start_settlement(Arc::clone(&queue));
+        let handles = executor.start_settlement(Arc::clone(&queue));
+        assert_eq!(
+            handles.len(),
+            SETTLEMENT_WATCHERS,
+            "one watcher per bundle that can be in flight"
+        );
         let started = Instant::now();
         executor.stop_settlement();
-        handle.join().expect("settlement watcher");
+        for handle in handles {
+            handle.join().expect("settlement watcher");
+        }
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

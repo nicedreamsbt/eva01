@@ -503,7 +503,7 @@ pub struct Liquidator {
     activity: Arc<LiquidationActivity>,
     threads: Vec<JoinHandle<()>>,
     /// Watches bundles after the relays accept them and releases those accounts.
-    settlement: Option<JoinHandle<()>>,
+    settlement: Vec<JoinHandle<()>>,
     tag_policy: TagPolicy,
     /// Tags due, sent from a thread of their own so the scan never waits on the RPC.
     tags: Sender<DueTag>,
@@ -890,7 +890,7 @@ impl Liquidator {
             reservations,
         )?;
         let tags = spawn_tagger(liquidator_account.clone())?;
-        let settlement = Some(executor.start_settlement(Arc::clone(&queue)));
+        let settlement = executor.start_settlement(Arc::clone(&queue));
 
         let evaluator = Arc::new(Evaluator {
             cache: cache.clone(),
@@ -1044,9 +1044,9 @@ impl Liquidator {
             }
         }
         self.executor.stop_settlement();
-        if let Some(thread) = self.settlement.take() {
+        for thread in self.settlement.drain(..) {
             if thread.join().is_err() {
-                error!("The settlement watcher panicked.");
+                error!("A settlement watcher panicked.");
             }
         }
         info!("The Liquidator loop is stopped.");
@@ -1624,7 +1624,13 @@ fn attempt_liquidation(
             queue.resized(&liquidatee, fresh.profit);
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
-                Ok(AttemptOutcome::Settling) => return AttemptRelease::WatcherOwns,
+                // An accepted bundle is a liquidation attempt that went out: it counts as activity
+                // (the rebalancer stays out of the way) and not as a failed retry, whatever the
+                // watcher later finds.
+                Ok(AttemptOutcome::Settling) => {
+                    attempt.succeeded();
+                    return AttemptRelease::WatcherOwns;
+                }
                 Ok(AttemptOutcome::Finished) => attempt.succeeded(),
                 Err(e) => {
                     error!(
