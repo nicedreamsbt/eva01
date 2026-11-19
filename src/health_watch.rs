@@ -45,6 +45,15 @@ pub struct Watch {
 }
 
 impl Watch {
+    /// A watch with its own tolerance: the relative move of any position's unit value it allows
+    /// before the account must be evaluated again, whatever its margin.
+    pub fn with_tolerance(tolerance: f64, positions: Vec<WatchedPosition>) -> Self {
+        Self {
+            tolerance,
+            positions,
+        }
+    }
+
     /// The watch for an account with `margin` (H / (A + L)), or `None` when it is too close to the
     /// threshold to skip any update.
     pub fn new(margin: f64, positions: Vec<WatchedPosition>) -> Option<Self> {
@@ -56,7 +65,7 @@ impl Watch {
 
     /// Whether a position whose bank and side `current` holds (its unit value now) has moved by
     /// at least the tolerance.
-    fn moved(&self, current: &HashMap<(Pubkey, bool), f64>) -> bool {
+    pub fn moved(&self, current: &HashMap<(Pubkey, bool), f64>) -> bool {
         self.positions.iter().any(|position| {
             current
                 .get(&(position.bank, position.liability))

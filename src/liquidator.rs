@@ -14,6 +14,7 @@ use crate::{
     },
     geyser::{AccountType, GeyserUpdate},
     health_watch::{self, HealthWatch, Watch, WatchedPosition},
+    hot_list::{HotConfig, HotList, HotMode, Standing},
     rebalancer::Rebalancer,
     tag_policy::{Balances, Candidate, TagPolicy},
     utils::{
@@ -69,11 +70,14 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicU64},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+mod ingest;
+use ingest::{observe_results, Handoff, HotStats, Ingest};
 
 /// Max liquidations executed concurrently. Bounds in-flight RPC/simulation load while still
 /// letting a burst of liquidatable accounts (e.g. a price crash) be worked in parallel rather
@@ -137,14 +141,58 @@ impl Sweep {
 /// How often the scan statistics are reported.
 const SCAN_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// A liquidation the update path and the background path both find within this long is one event:
+/// how far ahead the update path was is measured, and the background path's repeat sightings (its
+/// sweep, the next change) are not counted again.
+const HOT_EVENT_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many of the accounts that could earn `min_profit` fall in each margin band, for choosing the
+/// hot list's cutoff: under 0 (unhealthy), 0.5%, 1%, 2%, 4%, 8%, 16%, and above. And how many could
+/// earn it at all.
+fn sizing_buckets(standings: &HashMap<Pubkey, Standing>, min_profit: f64) -> ([usize; 8], usize) {
+    const EDGES: [f64; 7] = [0.0, 0.005, 0.01, 0.02, 0.04, 0.08, 0.16];
+    let mut buckets = [0usize; 8];
+    let mut could_pay = 0;
+    for standing in standings.values() {
+        if standing.potential_profit < min_profit {
+            continue;
+        }
+        could_pay += 1;
+        let band = EDGES
+            .iter()
+            .position(|edge| standing.margin < *edge)
+            .unwrap_or(EDGES.len());
+        buckets[band] += 1;
+    }
+    (buckets, could_pay)
+}
+
 /// What a batch of updates changed.
 #[derive(Default)]
 struct Changes {
+    /// When the oldest update in the batch arrived from the network.
+    oldest: Option<Instant>,
     /// Accounts to evaluate whatever their watch says: their own state changed, or their bank's
     /// configuration did.
     accounts: HashSet<Pubkey>,
     /// Banks whose price or share value may have moved.
     moved_banks: HashSet<Pubkey>,
+}
+
+impl Changes {
+    fn is_empty(&self) -> bool {
+        self.accounts.is_empty() && self.moved_banks.is_empty()
+    }
+
+    /// Adds what `other` changed to this batch.
+    fn merge(&mut self, other: Changes) {
+        self.oldest = match (self.oldest, other.oldest) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.accounts.extend(other.accounts);
+        self.moved_banks.extend(other.moved_banks);
+    }
 }
 
 /// Evaluation work since the last report.
@@ -154,8 +202,26 @@ struct ScanStats {
     skipped: usize,
     /// How long each cycle on a change took, apart from the sweep's slices.
     cycle_times: Vec<Duration>,
+    /// How long the oldest update of each batch had waited, from arriving off the network to its
+    /// cycle starting: queueing ahead of evaluation.
+    waits: Vec<Duration>,
+    /// The same, to the cycle finishing: the whole time from a change to every affected account
+    /// being evaluated and any liquidation queued.
+    detections: Vec<Duration>,
     sweeps: usize,
     slowest_sweep: Duration,
+}
+
+/// The median, 90th percentile and slowest of `times`, in ms.
+fn percentiles(times: &[Duration]) -> (u128, u128, u128) {
+    let mut times = times.to_vec();
+    times.sort();
+    let at = |q: f64| {
+        times
+            .get(((times.len() as f64 - 1.0) * q).round() as usize)
+            .map_or(0, Duration::as_millis)
+    };
+    (at(0.5), at(0.9), at(1.0))
 }
 
 impl ScanStats {
@@ -165,6 +231,8 @@ impl ScanStats {
             evaluated: 0,
             skipped: 0,
             cycle_times: Vec::new(),
+            waits: Vec::new(),
+            detections: Vec::new(),
             sweeps: 0,
             slowest_sweep: Duration::ZERO,
         }
@@ -172,14 +240,7 @@ impl ScanStats {
 
     /// The median, 90th percentile and slowest of the cycles on a change, in ms.
     fn cycle_percentiles(&self) -> (u128, u128, u128) {
-        let mut times = self.cycle_times.clone();
-        times.sort();
-        let at = |q: f64| {
-            times
-                .get(((times.len() as f64 - 1.0) * q).round() as usize)
-                .map_or(0, Duration::as_millis)
-        };
-        (at(0.5), at(0.9), at(1.0))
+        percentiles(&self.cycle_times)
     }
 }
 
@@ -220,6 +281,26 @@ fn tag_premium(base_premium: I80F48, tagged_at: i64, now: i64) -> I80F48 {
     let progress = I80F48::from_num(growth_secs) / I80F48::from_num(growth_window);
     base_premium + (TAG_MAX_PREMIUM - base_premium) * progress
 }
+
+/// A hot account is re-evaluated once any of its positions' unit values has moved this share of its
+/// margin since the last evaluation (the margin is what a move against it has to use up, so a quarter
+/// of it is checked well before the line).
+const HOT_TOLERANCE_SHARE: f64 = 0.25;
+
+/// A hot account counts as having at least this margin for its tolerance, so one almost on the line
+/// is not evaluated on every rounding.
+const HOT_MIN_MARGIN: f64 = 0.002;
+
+/// The relative move that re-evaluates an account already past the line: a liquidation of it is
+/// sized on prices, so it follows them closely.
+const HOT_UNHEALTHY_TOLERANCE: f64 = 0.0005;
+
+/// Accounts further than this from the line never get a hot watch.
+const HOT_WATCH_MARGIN_LIMIT: f64 = 0.25;
+
+/// Debt and collateral are valued here at maintenance prices and a liquidation at equity prices
+/// (time-weighted), which can differ by a few percent: the profit bound leaves this much room.
+const PRICE_SLACK: f64 = 1.2;
 
 /// Below this margin on eva's prices, an account is also priced on the chain's, which can lag
 /// eva's by about a price update and still allow a liquidation eva's prices don't.
@@ -313,7 +394,7 @@ fn wallet_share(cache: &Cache, liab_bank: &Pubkey, amount: I80F48) -> I80F48 {
 type Evaluations = (
     Vec<PreparedLiquidatableAccount>,
     Vec<UnhealthyAccount>,
-    Vec<(Pubkey, Option<Watch>)>,
+    Vec<HealthyAccount>,
 );
 
 /// What one share of `bank` on the given side is worth at its maintenance price, the unit a
@@ -418,7 +499,6 @@ pub struct Liquidator {
     /// The liquidation attempts the rebalancer stays out of the way of.
     activity: Arc<LiquidationActivity>,
     threads: Vec<JoinHandle<()>>,
-    liquidator_account: Arc<LiquidatorAccount>,
     tag_policy: TagPolicy,
     /// Tags due, sent from a thread of their own so the scan never waits on the RPC.
     tags: Sender<DueTag>,
@@ -427,7 +507,17 @@ pub struct Liquidator {
     health_watch: HealthWatch,
     sweep: Sweep,
     scan_stats: ScanStats,
-    geyser_rx: Receiver<GeyserUpdate>,
+    /// The update path (applies Geyser and Hermes updates, checks the hot list); moved onto its own
+    /// thread by [`Liquidator::start`].
+    ingest: Option<Ingest>,
+    ingest_thread: Option<JoinHandle<()>>,
+    /// What the update path has applied that this background path has not taken yet.
+    handoff: Arc<Handoff>,
+    hot: Arc<Mutex<HotList>>,
+    hot_config: HotConfig,
+    hot_stats: Arc<Mutex<HotStats>>,
+    /// Where each account last stood, to size the hot list in the minute report.
+    standings: HashMap<Pubkey, Standing>,
     stop_liquidator: Arc<AtomicBool>,
     cache: Arc<Cache>,
 }
@@ -689,14 +779,29 @@ impl RepayBounds {
 
 #[allow(clippy::large_enum_variant)]
 enum Evaluation {
-    /// Healthy: the watch that lets updates skip it while it stays so.
-    Healthy(Pubkey, Option<Watch>),
+    Healthy(HealthyAccount),
     Liquidate(PreparedLiquidatableAccount),
     /// Unhealthy but not worth liquidating at the current premium.
     Unhealthy(UnhealthyAccount),
 }
 
+/// A healthy account: the watch that lets updates skip it while it stays so, and where it stands
+/// for the hot list.
+struct HealthyAccount {
+    address: Pubkey,
+    watch: Option<Watch>,
+    /// What re-evaluates it as a hot account; `None` when it is not near the line.
+    hot_watch: Option<Watch>,
+    standing: Standing,
+    /// The banks it holds.
+    banks: Vec<Pubkey>,
+}
+
 struct UnhealthyAccount {
+    /// The most a liquidation of it could earn (USD), for the hot list.
+    potential_profit: f64,
+    /// What re-evaluates it as a hot account.
+    hot_watch: Option<Watch>,
     attempt_id: u64,
     address: Pubkey,
     observation_accounts: ObservationAccounts,
@@ -778,27 +883,60 @@ impl Liquidator {
             reservations,
         )?;
 
+        let evaluator = Arc::new(Evaluator {
+            cache: cache.clone(),
+            pusher,
+            min_profit: config.min_profit,
+            max_profit: config.max_profit,
+        });
+        let queue = Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN));
+        let handoff = Arc::new(Handoff::new());
+        let hot_config = HotConfig::from_env();
+        info!(
+            "Hot path: mode {:?}, margin cutoff {}, at most {} account(s), {} thread(s)",
+            hot_config.mode, hot_config.margin_cutoff, hot_config.max_accounts, hot_config.threads
+        );
+        let hot = Arc::new(Mutex::new(HotList::new(&hot_config, config.min_profit)));
+        let hot_stats = Arc::new(Mutex::new(HotStats::default()));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(hot_config.threads)
+            .thread_name(|index| format!("hot-path-{index}"))
+            .build()?;
+        let ingest = Ingest {
+            cache: cache.clone(),
+            queue: queue.clone(),
+            liquidator_account: liquidator_account.clone(),
+            evaluator: evaluator.clone(),
+            geyser_rx,
+            stop_liquidator: stop_liquidator.clone(),
+            handoff: handoff.clone(),
+            hot: hot.clone(),
+            hot_mode: hot_config.mode,
+            hot_stats: hot_stats.clone(),
+            pool,
+        };
+
         Ok(Liquidator {
             rebalancer: Some(rebalancer),
             executor: Arc::new(executor),
             strategy: Arc::new(strategy),
-            evaluator: Arc::new(Evaluator {
-                cache: cache.clone(),
-                pusher,
-                min_profit: config.min_profit,
-                max_profit: config.max_profit,
-            }),
-            queue: Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN)),
+            evaluator,
+            queue,
             activity,
             threads: Vec::new(),
             tags: spawn_tagger(liquidator_account.clone())?,
-            liquidator_account,
             tag_policy: TagPolicy::new(),
             skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
             health_watch: HealthWatch::default(),
             sweep: Sweep::default(),
             scan_stats: ScanStats::new(),
-            geyser_rx,
+            ingest: Some(ingest),
+            ingest_thread: None,
+            handoff,
+            hot,
+            hot_config,
+            hot_stats,
+            standings: HashMap::new(),
             stop_liquidator,
             cache,
         })
@@ -817,13 +955,14 @@ impl Liquidator {
         }
         self.spawn_threads(rebalancer)?;
 
-        // Updates only reach the cache through this loop, so everything Geyser and Hermes sent
+        // Updates only reach the cache through the update path, so everything Geyser and Hermes sent
         // since the cache was loaded (the startup rebalance alone takes seconds) is still queued.
         // Apply it first, or the initial scan prices every account on the load-time snapshot.
-        let mut backlog = Changes::default();
-        while let Ok(update) = self.geyser_rx.try_recv() {
-            self.process_geyser_update(update, &mut backlog);
-        }
+        let ingest = self
+            .ingest
+            .take()
+            .ok_or_else(|| anyhow!("the Liquidator was already started"))?;
+        let backlog = ingest.drain_backlog();
 
         // Geyser only delivers changes, so an account that is already underwater at startup would
         // wait for an unrelated update to touch one of its banks. Sweep them all once up front.
@@ -838,7 +977,7 @@ impl Liquidator {
                     backlog.accounts.len(),
                     backlog.moved_banks.len()
                 );
-                self.run_liquidation_cycle(accounts, false);
+                self.run_liquidation_cycle(accounts, false, None);
             }
             Err(error) => error!(
                 "Failed to collect accounts for the initial scan: {:?}",
@@ -846,13 +985,27 @@ impl Liquidator {
             ),
         }
 
+        // From here the update path applies updates and checks the hot list as they arrive; this
+        // thread is the background path, which takes what it applied and evaluates everyone else.
+        self.ingest_thread = Some(thread::Builder::new().name("ingest".to_string()).spawn(
+            move || {
+                if let Err(e) = ingest.run() {
+                    // A service that dies leaves the process up but deaf: exit, so the
+                    // supervisor restarts eva with a fresh cache.
+                    error!("The update path failed, exiting: {:?}", e);
+                    std::process::exit(1);
+                }
+            },
+        )?);
+
         info!("Staring the Liquidator loop.");
         while !self.stop_liquidator.load(Ordering::Relaxed) {
             debug!("Waiting for any data change...");
-            let changes = self.receive_geyser_updates()?;
+            let changes = self.handoff.take(Duration::from_secs(1));
+            let oldest = changes.oldest;
             let accounts_to_check = self.accounts_to_evaluate(changes);
             if !accounts_to_check.is_empty() {
-                self.run_liquidation_cycle(accounts_to_check, false);
+                self.run_liquidation_cycle(accounts_to_check, false, oldest);
             }
             let slice = self.sweep.next_slice(Instant::now(), || {
                 self.cache
@@ -862,7 +1015,7 @@ impl Liquidator {
                     .unwrap_or_default()
             });
             if !slice.is_empty() {
-                self.run_liquidation_cycle(slice, true);
+                self.run_liquidation_cycle(slice, true, None);
             }
             self.report_scan_stats();
         }
@@ -873,6 +1026,11 @@ impl Liquidator {
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
                 error!("A liquidation worker or the rebalancer panicked.");
+            }
+        }
+        if let Some(thread) = self.ingest_thread.take() {
+            if thread.join().is_err() {
+                error!("The update path panicked.");
             }
         }
         info!("The Liquidator loop is stopped.");
@@ -919,6 +1077,7 @@ impl Liquidator {
     /// moved bank whose watch says the move may have reached their margin.
     fn accounts_to_evaluate(&mut self, changes: Changes) -> Vec<Pubkey> {
         let Changes {
+            oldest: _,
             mut accounts,
             moved_banks,
         } = changes;
@@ -986,10 +1145,24 @@ impl Liquidator {
     /// Evaluates `accounts_to_check`. A full sweep (`full`) also audits the health watch: an
     /// account it still watches hasn't needed evaluating since it was last healthy, so finding it
     /// unhealthy now means the watch missed it.
-    fn run_liquidation_cycle(&mut self, accounts_to_check: Vec<Pubkey>, full: bool) {
+    ///
+    /// `oldest` is when the oldest update behind this cycle arrived from the network. The accounts
+    /// the cycle evaluates tell the hot list who belongs on it; the ones the update path evaluated
+    /// since the cycle began are left to it, whose result is newer.
+    fn run_liquidation_cycle(
+        &mut self,
+        accounts_to_check: Vec<Pubkey>,
+        full: bool,
+        oldest: Option<Instant>,
+    ) {
         let started = Instant::now();
+        if let Some(oldest) = oldest {
+            self.scan_stats
+                .waits
+                .push(started.saturating_duration_since(oldest));
+        }
         match self.evaluator.check_accounts(&accounts_to_check) {
-            Ok((liquidations, unhealthy, healthy)) => {
+            Ok((mut liquidations, unhealthy, healthy)) => {
                 if full {
                     let missed: Vec<Pubkey> = liquidations
                         .iter()
@@ -1010,11 +1183,46 @@ impl Liquidator {
                 for account in &accounts_to_check {
                     self.health_watch.set(*account, None);
                 }
-                for (account, watch) in healthy {
-                    self.health_watch.set(account, watch);
+                for account in &healthy {
+                    self.health_watch
+                        .set(account.address, account.watch.clone());
                 }
+
+                // The hot list: what this cycle found out about each account, except those the
+                // update path has evaluated since the cycle began.
+                let hot_checked: HashSet<Pubkey> = {
+                    let hot = self.hot.lock().unwrap_or_else(|e| e.into_inner());
+                    accounts_to_check
+                        .iter()
+                        .filter(|account| hot.checked_since(account, started))
+                        .copied()
+                        .collect()
+                };
+                self.compare_with_hot_path(&liquidations, started);
+                self.update_hot_list(
+                    &accounts_to_check,
+                    &liquidations,
+                    &unhealthy,
+                    &healthy,
+                    &hot_checked,
+                );
+
+                // With the update path acting, an account it has checked since this cycle began
+                // keeps what it queued: this cycle's result for it is older.
+                let skip_queue: HashSet<Pubkey> = if self.hot_config.mode == HotMode::On {
+                    hot_checked
+                } else {
+                    HashSet::new()
+                };
+                let checked: Vec<Pubkey> = accounts_to_check
+                    .iter()
+                    .filter(|account| !skip_queue.contains(account))
+                    .copied()
+                    .collect();
+                liquidations
+                    .retain(|intent| !skip_queue.contains(&intent.liquidatee_account.address));
                 let liquidatable = liquidations.len();
-                self.queue.offer(&accounts_to_check, liquidations);
+                self.queue.offer(&checked, liquidations);
                 self.handle_unhealthy(&accounts_to_check, &unhealthy);
                 let elapsed = started.elapsed();
                 let stats = &mut self.scan_stats;
@@ -1024,6 +1232,9 @@ impl Liquidator {
                     stats.slowest_sweep = stats.slowest_sweep.max(elapsed);
                 } else {
                     stats.cycle_times.push(elapsed);
+                    if let Some(oldest) = oldest {
+                        stats.detections.push(oldest.elapsed());
+                    }
                 }
                 debug!(
                     "Evaluated {} account(s) in {} ms: {} queued for liquidation, {} unhealthy but not worth liquidating.",
@@ -1059,123 +1270,196 @@ impl Liquidator {
             stats.skipped,
             self.health_watch.len()
         );
+        let (wait_median, wait_p90, wait_max) = percentiles(&stats.waits);
+        let (detect_median, detect_p90, detect_max) = percentiles(&stats.detections);
+        info!(
+            "DETECTION_TIMING background path, {} batch(es): an update waited for its cycle {} ms median, {} ms p90, {} ms at most; arrival to every affected account evaluated {} ms median, {} ms p90, {} ms at most.",
+            stats.detections.len(),
+            wait_median,
+            wait_p90,
+            wait_max,
+            detect_median,
+            detect_p90,
+            detect_max
+        );
         self.scan_stats = ScanStats::new();
+        self.report_hot_path();
     }
 
-    fn receive_geyser_updates(&self) -> Result<Changes> {
-        let first_update = match self.geyser_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(update) => update,
-            Err(RecvTimeoutError::Timeout) => return Ok(Changes::default()),
-            Err(RecvTimeoutError::Disconnected) if self.stop_liquidator.load(Ordering::Relaxed) => {
-                return Ok(Changes::default())
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!("Geyser update channel disconnected"))
-            }
+    /// The update path's minute: how big the hot list is, how long its checks took, how much earlier
+    /// than the background path it found liquidations, and what only the background path found. And
+    /// the sizing of the whole book by margin, to choose the cutoff.
+    fn report_hot_path(&mut self) {
+        let now = Instant::now();
+        let (batches, evaluated, check_times, arrivals, found, leads, misses) = {
+            let mut stats = self.hot_stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats
+                .found_at
+                .retain(|_, at| now.saturating_duration_since(*at) < HOT_EVENT_WINDOW * 2);
+            stats
+                .background_seen
+                .retain(|_, at| now.saturating_duration_since(*at) < HOT_EVENT_WINDOW * 2);
+            (
+                std::mem::take(&mut stats.batches),
+                std::mem::take(&mut stats.evaluated),
+                std::mem::take(&mut stats.check_times),
+                std::mem::take(&mut stats.arrival_to_queue),
+                std::mem::take(&mut stats.found),
+                std::mem::take(&mut stats.leads),
+                std::mem::take(&mut stats.misses),
+            )
         };
+        let (len, range, overflowed) = {
+            let mut hot = self.hot.lock().unwrap_or_else(|e| e.into_inner());
+            (hot.len(), hot.margin_range(), hot.take_overflowed())
+        };
+        let (check_median, check_p90, check_max) = percentiles(&check_times);
+        let (arrival_median, arrival_p90, arrival_max) = percentiles(&arrivals);
+        let (lead_median, lead_p90, lead_max) = percentiles(&leads);
+        info!(
+            "HOT_PATH mode={:?} list={} margin(min,median,max)={:?} overflowed={}; {} batch(es) checked {} account(s) in {} ms median, {} ms p90, {} ms at most; {} liquidation(s) found, arrival to queue {} ms median, {} ms p90, {} ms at most; ahead of the background path by {} ms median, {} ms p90, {} ms at most ({} compared); {} found only by the background path.",
+            self.hot_config.mode,
+            len,
+            range.map(|(low, median, high)| (
+                (low * 1e4).round() / 1e4,
+                (median * 1e4).round() / 1e4,
+                (high * 1e4).round() / 1e4
+            )),
+            overflowed,
+            batches,
+            evaluated,
+            check_median,
+            check_p90,
+            check_max,
+            found,
+            arrival_median,
+            arrival_p90,
+            arrival_max,
+            lead_median,
+            lead_p90,
+            lead_max,
+            leads.len(),
+            misses
+        );
 
-        let mut changes = Changes::default();
-        self.process_geyser_update(first_update, &mut changes);
-        while let Ok(update) = self.geyser_rx.try_recv() {
-            self.process_geyser_update(update, &mut changes);
-        }
-        Ok(changes)
+        // Where the whole book stands, for choosing the margin cutoff and the list size.
+        let (buckets, could_pay) = sizing_buckets(&self.standings, self.evaluator.min_profit);
+        info!(
+            "HOT_SIZING {} account(s) evaluated, {} could earn the minimum; by margin (<0, <0.5%, <1%, <2%, <4%, <8%, <16%, >=16%) those that could: {:?}; cutoff {}.",
+            self.standings.len(),
+            could_pay,
+            buckets,
+            self.hot_config.margin_cutoff
+        );
     }
 
-    fn process_geyser_update(&self, update: GeyserUpdate, changes: &mut Changes) {
-        if let Err(error) = self.handle_geyser_update(update, changes) {
-            log_genuine_error("Failed to process Geyser update", error);
+    /// Compares the liquidations this cycle found with what the update path found: how much earlier
+    /// the update path was, and the ones only this cycle found.
+    fn compare_with_hot_path(
+        &self,
+        liquidations: &[PreparedLiquidatableAccount],
+        started: Instant,
+    ) {
+        if self.hot_config.mode == HotMode::Off || liquidations.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let hot = self.hot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats = self.hot_stats.lock().unwrap_or_else(|e| e.into_inner());
+        for intent in liquidations {
+            let address = intent.liquidatee_account.address;
+            // Seen by this path a moment ago: the same event, not a new one.
+            let repeat = stats
+                .background_seen
+                .get(&address)
+                .is_some_and(|at| now.saturating_duration_since(*at) < HOT_EVENT_WINDOW);
+            stats.background_seen.insert(address, now);
+            if repeat {
+                continue;
+            }
+            match stats.found_at.get(&address).copied() {
+                Some(found) if now.saturating_duration_since(found) < HOT_EVENT_WINDOW => {
+                    let lead = now.saturating_duration_since(found);
+                    stats.leads.push(lead);
+                    info!(
+                        "HOT_LEAD account={} hot_path_ahead_ms={}",
+                        address,
+                        lead.as_millis()
+                    );
+                }
+                _ => {
+                    stats.misses += 1;
+                    warn!(
+                        "HOT_MISS account={} on_list_when_the_cycle_began={} mode={:?}",
+                        address,
+                        hot.was_hot_at(&address, started),
+                        self.hot_config.mode
+                    );
+                }
+            }
         }
     }
 
-    /// Our clock lags the chain, so a fresh Scope price can look "published in the future" and get
-    /// rejected. Moving the clock up to each new publish time prevents that.
-    fn advance_clock_to_oracle(&self, address: &Pubkey, account: &Account, banks: &[Pubkey]) {
-        let scope_entries: Vec<u16> = banks
+    /// Records what a cycle found out about each account it evaluated: in the hot list (except the
+    /// accounts in `skip`, whose newer result the update path has), and in the standings that size
+    /// the book. An account it could not evaluate at all leaves both.
+    fn update_hot_list(
+        &mut self,
+        checked: &[Pubkey],
+        liquidations: &[PreparedLiquidatableAccount],
+        unhealthy: &[UnhealthyAccount],
+        healthy: &[HealthyAccount],
+        skip: &HashSet<Pubkey>,
+    ) {
+        let answered: HashSet<Pubkey> = liquidations
             .iter()
-            .filter_map(|bank| self.cache.banks.try_get_bank(bank).ok())
-            .filter(|wrapper| {
-                matches!(
-                    wrapper.bank.config.oracle_setup,
-                    OracleSetup::Scope | OracleSetup::ScopeKamino | OracleSetup::ScopeJuplend
-                ) && wrapper.bank.config.oracle_keys[0] == *address
-            })
-            .map(|wrapper| wrapper.bank.config.scope_entry_index)
+            .map(|intent| intent.liquidatee_account.address)
+            .chain(unhealthy.iter().map(|account| account.address))
+            .chain(healthy.iter().map(|account| account.address))
             .collect();
-
-        if let Some(publish_time) = oracle_publish_time(account, &scope_entries) {
-            if let Err(e) = clock_manager::advance_to(&self.cache.clock, publish_time) {
-                error!("Failed to advance the clock to the {address} publish time: {e}");
+        if self.hot_config.mode != HotMode::Off {
+            let mut hot = self.hot.lock().unwrap_or_else(|e| e.into_inner());
+            for account in checked {
+                if !answered.contains(account) && !skip.contains(account) {
+                    hot.remove(account);
+                }
+            }
+            observe_results(
+                &mut hot,
+                liquidations,
+                unhealthy,
+                healthy,
+                Instant::now(),
+                None,
+                skip,
+            );
+        }
+        for account in checked {
+            if !answered.contains(account) {
+                self.standings.remove(account);
             }
         }
-    }
-
-    fn handle_geyser_update(&self, update: GeyserUpdate, changes: &mut Changes) -> Result<()> {
-        let GeyserUpdate {
-            account_type,
-            address,
-            account,
-            slot,
-        } = update;
-
-        debug!("Processing the {:?} {:?} update.", account_type, address);
-
-        match account_type {
-            AccountType::Oracle | AccountType::HermesPrice => {
-                if matches!(account_type, AccountType::Oracle) {
-                    self.cache.pyth_prices.record_onchain(address, &account);
-                }
-                let banks = self.cache.banks.get_banks_for_oracle(&address)?;
-                self.advance_clock_to_oracle(&address, &account, &banks);
-                // An older price than the one cached changes nothing to evaluate.
-                if !self.cache.oracles.try_update(&address, account)? {
-                    return Ok(());
-                }
-
-                changes.moved_banks.extend(banks);
-            }
-            AccountType::Marginfi => {
-                let mut data = account.data.as_slice();
-                let marginfi_account = MarginfiAccount::try_deserialize(&mut data)?;
-                let has_liabilities = self
-                    .cache
-                    .marginfi_accounts
-                    .try_insert(MarginfiAccountWrapper::new(address, marginfi_account))?;
-
-                // Only queue accounts that carry debt — a debt-free account can't be liquidated, so
-                // evaluating it is wasted work. It rejoins the queue the moment it borrows (that
-                // update will report liabilities).
-                self.queue.account_updated(address, slot);
-                if has_liabilities {
-                    changes.accounts.insert(address);
-                }
-            }
-            AccountType::Bank => {
-                let bank = utils::decode_bank(&account.data)?;
-                let previous = self.cache.banks.try_get_bank(&address).ok();
-                let reconfigured = previous.as_ref().is_none_or(|previous| {
-                    previous.bank.config != bank.config || previous.bank.emode != bank.emode
-                });
-                self.cache.banks.try_insert(address, bank, account)?;
-                if previous.is_none() {
-                    self.liquidator_account.cover_bank_in_background(&address);
-                }
-
-                // Only the share values move on most updates, which the health watch measures; a
-                // new weight, limit or oracle can change any holder's health.
-                if reconfigured {
-                    self.add_accounts_for_bank(&address, &mut changes.accounts)?;
-                } else {
-                    changes.moved_banks.insert(address);
-                }
-            }
-            AccountType::Token => {
-                self.cache
-                    .tokens
-                    .try_update_account(address, account, slot)?;
-            }
+        for intent in liquidations {
+            self.standings.insert(
+                intent.liquidatee_account.address,
+                Standing {
+                    margin: -1.0,
+                    potential_profit: intent.profit.to_num::<f64>(),
+                },
+            );
         }
-        Ok(())
+        for account in unhealthy {
+            self.standings.insert(
+                account.address,
+                Standing {
+                    margin: -1.0,
+                    potential_profit: account.potential_profit,
+                },
+            );
+        }
+        for account in healthy {
+            self.standings.insert(account.address, account.standing);
+        }
     }
 
     fn add_accounts_for_bank(
@@ -1396,8 +1680,17 @@ impl Evaluator {
         unit_values: &UnitValues,
         margin: f64,
     ) -> Option<Watch> {
+        Watch::new(margin, self.positions_for(account, unit_values)?)
+    }
+
+    /// The account's positions and their unit values now. `None` when one can't be priced.
+    fn positions_for(
+        &self,
+        account: &MarginfiAccountWrapper,
+        unit_values: &UnitValues,
+    ) -> Option<Vec<WatchedPosition>> {
         let (deposits, liabilities) = account.get_deposits_and_liabilities_shares();
-        let positions = deposits
+        deposits
             .iter()
             .map(|(_, bank)| (*bank, false))
             .chain(liabilities.iter().map(|(_, bank)| (*bank, true)))
@@ -1408,8 +1701,32 @@ impl Evaluator {
                     unit_value: unit_values.get(&bank, liability)?,
                 })
             })
-            .collect::<Option<Vec<_>>>()?;
-        Watch::new(margin, positions)
+            .collect()
+    }
+
+    /// The watch a hot account is re-evaluated on: a much tighter one than a healthy account's, so
+    /// that a price move that could bring it to the line is always seen, and one that could not is
+    /// not (a bank's share value moves on every interaction with it). `margin` is negative for an
+    /// account already past the line. `None` when a position can't be priced, or the account is not
+    /// near enough the line to be hot.
+    fn hot_watch_for(
+        &self,
+        account: &MarginfiAccountWrapper,
+        unit_values: &UnitValues,
+        margin: f64,
+    ) -> Option<Watch> {
+        if margin >= HOT_WATCH_MARGIN_LIMIT {
+            return None;
+        }
+        let tolerance = if margin < 0.0 {
+            HOT_UNHEALTHY_TOLERANCE
+        } else {
+            margin.max(HOT_MIN_MARGIN) * HOT_TOLERANCE_SHARE
+        };
+        Some(Watch::with_tolerance(
+            tolerance,
+            self.positions_for(account, unit_values)?,
+        ))
     }
 
     fn check_accounts(&self, account_addresses: &[Pubkey]) -> Result<Evaluations> {
@@ -1442,7 +1759,7 @@ impl Evaluator {
         let mut healthy = Vec::new();
         for evaluation in evaluations {
             match evaluation {
-                Evaluation::Healthy(address, watch) => healthy.push((address, watch)),
+                Evaluation::Healthy(account) => healthy.push(account),
                 Evaluation::Liquidate(acc) => liquidations.push(acc),
                 Evaluation::Unhealthy(acc) => unhealthy.push(acc),
             }
@@ -1499,6 +1816,18 @@ impl Evaluator {
             RequirementType::Maintenance,
         )?;
 
+        // The most a liquidation of this account could ever earn, for the hot list.
+        let potential_profit = self.potential_profit_usd(
+            liab_values
+                .iter()
+                .map(|(value, _)| value.to_num::<f64>())
+                .sum(),
+            deposit_values
+                .iter()
+                .map(|(value, _)| value.to_num::<f64>())
+                .sum(),
+        );
+
         let (asset_banks, liab_banks) =
             match self.find_liquidation_bank_candidates(deposit_values, liab_values)? {
                 Some(banks) => banks,
@@ -1528,11 +1857,42 @@ impl Evaluator {
             PairSearch::Sized(sizing) => sizing,
             PairSearch::Healthy(margin) => {
                 let watch = self.watch_for(account, unit_values, margin);
-                return Ok(Some(Evaluation::Healthy(account.address, watch)));
+                let hot_watch = self.hot_watch_for(account, unit_values, margin);
+                return Ok(Some(Evaluation::Healthy(HealthyAccount {
+                    address: account.address,
+                    watch,
+                    hot_watch,
+                    standing: Standing {
+                        margin,
+                        potential_profit,
+                    },
+                    banks: active,
+                })));
             }
             PairSearch::None => return Ok(None),
         };
-        self.prepare(account, observation_accounts, sizing)
+        Ok(match self.prepare(account, observation_accounts, sizing)? {
+            Some(Evaluation::Unhealthy(unhealthy)) => {
+                Some(Evaluation::Unhealthy(UnhealthyAccount {
+                    potential_profit,
+                    hot_watch: self.hot_watch_for(account, unit_values, -1.0),
+                    ..unhealthy
+                }))
+            }
+            other => other,
+        })
+    }
+
+    /// The most a liquidation of an account with `debt_usd` of debt and `collateral_usd` of
+    /// collateral (at maintenance prices) could earn: what it repays can't exceed the debt or the
+    /// collateral less its premium, and the premium is at most the largest one the program or a tag
+    /// allows. Liquidations are valued at equity prices, which can differ from the maintenance ones
+    /// by a few percent, so the bound leaves room for it: it is an upper bound.
+    fn potential_profit_usd(&self, debt_usd: f64, collateral_usd: f64) -> f64 {
+        let premium =
+            I80F48::max(TAG_MAX_PREMIUM, self.cache.liquidation_max_fee()).to_num::<f64>();
+        let repay = debt_usd.min(collateral_usd / (1.0 + premium)) * PRICE_SLACK;
+        repay * premium * LIQUIDATION_SIZE_HAIRCUT.to_num::<f64>()
     }
 
     /// The liquidation `sizing` allows, or the unhealthy account it leaves when none is worth it.
@@ -1556,6 +1916,8 @@ impl Evaluator {
 
         if !liquidation_amounts.is_liquidatable() {
             return Ok(Some(Evaluation::Unhealthy(UnhealthyAccount {
+                potential_profit: 0.0,
+                hot_watch: None,
                 attempt_id,
                 address: account.address,
                 observation_accounts,
@@ -2589,5 +2951,50 @@ mod push_choice_tests {
         };
         let sol_pushed = program_accounts(&cache, &oracles, Pricing::Pushed(&push)).unwrap();
         assert_eq!(sol_pushed.iter().map(price).collect::<Vec<_>>(), vec![3, 1]);
+    }
+}
+
+#[cfg(test)]
+mod hot_path_tests {
+    use super::*;
+
+    #[test]
+    fn the_book_is_sized_by_margin_among_the_accounts_that_could_pay() {
+        let standing = |margin: f64, potential_profit: f64| Standing {
+            margin,
+            potential_profit,
+        };
+        let standings: HashMap<Pubkey, Standing> = [
+            standing(-1.0, 5.0),  // unhealthy
+            standing(0.003, 5.0), // under 0.5%
+            standing(0.03, 5.0),  // under 4%
+            standing(0.03, 0.5),  // could never pay the minimum
+            standing(0.50, 5.0),  // far from the line
+        ]
+        .into_iter()
+        .map(|standing| (Pubkey::new_unique(), standing))
+        .collect();
+
+        let (buckets, could_pay) = sizing_buckets(&standings, 1.0);
+        assert_eq!(could_pay, 4);
+        assert_eq!(buckets, [1, 1, 0, 0, 1, 0, 0, 1]);
+    }
+
+    #[test]
+    fn batches_merge_keeping_the_oldest_arrival() {
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let now = Instant::now();
+        let mut one = Changes::default();
+        assert!(one.is_empty());
+        one.accounts.insert(a);
+
+        let mut two = Changes::default();
+        two.oldest = Some(now);
+        two.moved_banks.insert(b);
+
+        one.merge(two);
+        assert_eq!(one.oldest, Some(now), "an undated batch takes the other's");
+        assert!(!one.is_empty());
+        assert!(one.accounts.contains(&a) && one.moved_banks.contains(&b));
     }
 }

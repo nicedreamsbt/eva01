@@ -27,6 +27,7 @@ mod config;
 mod execution;
 mod geyser;
 mod health_watch;
+mod hot_list;
 mod juplend_ixs;
 mod kamino_ixs;
 mod liquidator;

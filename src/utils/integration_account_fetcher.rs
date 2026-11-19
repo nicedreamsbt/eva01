@@ -57,6 +57,7 @@ impl IntegrationAccountFetcher {
             address,
             account,
             slot: 0,
+            received_at: std::time::Instant::now(),
         }) {
             warn!("IntegrationAccountFetcher: failed to publish the {address} update: {e}");
         }

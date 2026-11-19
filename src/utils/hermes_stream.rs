@@ -353,6 +353,7 @@ impl HermesStream {
                 address: *oracle,
                 account,
                 slot: 0,
+                received_at: Instant::now(),
             })
             .map_err(|e| anyhow!("failed to publish the {oracle} price: {e}"))
     }

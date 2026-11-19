@@ -38,6 +38,9 @@ pub struct GeyserUpdate {
     /// The slot the account was read at, or 0 when the source does not report one. Only wallet
     /// token updates use it, to never let an older read replace a newer one.
     pub slot: u64,
+    /// When the message carrying this update arrived from the network, to time how long eva takes
+    /// from a price or account change to a liquidation in the queue.
+    pub received_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,6 +194,7 @@ impl GeyserService {
                 };
                 match msg {
                     Ok(msg) => {
+                        let received_at = Instant::now();
                         // A delivered message proves the connection is healthy: reset the backoff.
                         backoff = INITIAL_RECONNECT_BACKOFF;
                         delivered = true;
@@ -232,6 +236,7 @@ impl GeyserService {
                                         address,
                                         &account,
                                         update_slot,
+                                        received_at,
                                     );
                                 }
 
@@ -244,10 +249,17 @@ impl GeyserService {
                                         address,
                                         &account,
                                         update_slot,
+                                        received_at,
                                     );
                                 }
                             } else if let Some(account_type) = self.tracked_accounts.get(&address) {
-                                self.send_update(*account_type, address, &account, update_slot);
+                                self.send_update(
+                                    *account_type,
+                                    address,
+                                    &account,
+                                    update_slot,
+                                    received_at,
+                                );
                             }
                         }
                     }
@@ -308,12 +320,14 @@ impl GeyserService {
         address: Pubkey,
         account: &Account,
         slot: u64,
+        received_at: Instant,
     ) {
         let update = GeyserUpdate {
             account_type,
             address,
             account: account.clone(),
             slot,
+            received_at,
         };
         if let Err(e) = self.geyser_tx.send(update) {
             error!("Error channeling update to the Geyser processor! {:?}", e);
