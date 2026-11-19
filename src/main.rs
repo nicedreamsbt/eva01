@@ -32,6 +32,7 @@ mod kamino_ixs;
 mod liquidator;
 mod marginfi_ixs;
 mod rebalancer;
+mod screen;
 mod tag_policy;
 mod transaction_limits;
 mod utils;

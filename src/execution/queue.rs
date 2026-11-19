@@ -90,6 +90,7 @@ impl ExecutionQueue {
 
     /// Replaces the intents of the `checked` accounts with `intents`: an account that was checked
     /// and is no longer liquidatable leaves the queue.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn offer(&self, checked: &[Pubkey], intents: Vec<PreparedLiquidatableAccount>) {
         let mut state = self.lock();
         for address in checked {
@@ -104,6 +105,32 @@ impl ExecutionQueue {
         }
         drop(state);
         self.ready.notify_all();
+    }
+
+    /// Puts one intent in the queue the moment its evaluation finishes, replacing the account's
+    /// older one, so a worker can take it while the rest of the batch is still being evaluated.
+    /// Pair with [`Self::retire_unless`] once the batch is done.
+    pub fn upsert(&self, intent: PreparedLiquidatableAccount) {
+        let address = intent.liquidatee_account.address;
+        self.lock().pending.insert(
+            address,
+            QueuedIntent {
+                intent,
+                queued_at: Instant::now(),
+            },
+        );
+        self.ready.notify_one();
+    }
+
+    /// Withdraws the intents of the `checked` accounts that the batch no longer found
+    /// liquidatable: those not in `kept`, which were each `upsert`ed as the batch found them.
+    pub fn retire_unless(&self, checked: &[Pubkey], kept: &std::collections::HashSet<Pubkey>) {
+        let mut state = self.lock();
+        for address in checked {
+            if !kept.contains(address) {
+                state.pending.remove(address);
+            }
+        }
     }
 
     /// Blocks until an intent is ready and hands it out; `None` once the queue is stopped.
@@ -353,6 +380,30 @@ mod tests {
         assert_eq!(take_now(&queue), Some((a, I80F48::from_num(5))));
         assert_eq!(take_now(&queue).unwrap().0, untouched);
         assert!(take_now(&queue).is_none());
+    }
+
+    #[test]
+    fn streamed_intents_are_taken_before_the_batch_ends_and_stale_ones_retired() {
+        let queue = ExecutionQueue::new(Duration::ZERO);
+        let (a, b, c) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        // `b` and `c` were queued by an earlier batch.
+        queue.offer(&[b, c], vec![intent(b, 1), intent(c, 1)]);
+
+        // A new batch over a, b, c: `a` is found at once and is takeable before the batch ends.
+        queue.upsert(intent(a, 7));
+        assert_eq!(take_now(&queue), Some((a, I80F48::from_num(7))));
+
+        // `b` is found again (re-sized); `c` is not: it is retired at the end.
+        queue.upsert(intent(b, 4));
+        let kept: std::collections::HashSet<Pubkey> = [a, b].into_iter().collect();
+        queue.retire_unless(&[a, b, c], &kept);
+
+        assert_eq!(take_now(&queue), Some((b, I80F48::from_num(4))));
+        assert!(take_now(&queue).is_none(), "c was retired");
     }
 
     #[test]
