@@ -81,6 +81,9 @@ struct LaneStats {
     over_budget: usize,
     no_slot: usize,
     not_worth_it: usize,
+    /// How long each request to the venue took, answered or not: a Jupiter route is its quote and
+    /// its swap instructions together, a Titan route one websocket request.
+    round_trips: Vec<Duration>,
     /// Routes the venue won, errors it returned, and rate-limit answers among them.
     won: usize,
     errors: usize,
@@ -272,6 +275,10 @@ impl VenueLimits {
         }
     }
 
+    fn note_round_trip(&self, venue: Venue, took: Duration) {
+        self.with_lane(venue, |lane| lane.stats.round_trips.push(took));
+    }
+
     fn note_not_worth_it(&self, venue: Venue) {
         self.with_lane(venue, |lane| lane.stats.not_worth_it += 1);
     }
@@ -309,12 +316,23 @@ impl VenueLimits {
                         .copied()
                         .unwrap_or(0)
                 };
+                let mut trips: Vec<u128> = stats.round_trips.iter().map(Duration::as_millis).collect();
+                trips.sort_unstable();
+                let trip = |q: f64| {
+                    trips
+                        .get(((trips.len() as f64 - 1.0).max(0.0) * q).round() as usize)
+                        .copied()
+                        .unwrap_or(0)
+                };
                 format!(
-                    "{}(requests={} waited_ms p50/max={}/{} over_budget={} no_slot={} not_worth_it={} won={} errors={} rate_limited={})",
+                    "{}(requests={} waited_ms p50/max={}/{} round_trip_ms p50/p90/max={}/{}/{} over_budget={} no_slot={} not_worth_it={} won={} errors={} rate_limited={})",
                     venue.name(),
                     stats.reserved,
                     wait(0.5),
                     wait(1.0),
+                    trip(0.5),
+                    trip(0.9),
+                    trip(1.0),
                     stats.over_budget,
                     stats.no_slot,
                     stats.not_worth_it,
@@ -557,6 +575,7 @@ impl<S: QuoteSource> VenueSet<S> {
             let Some((venue, took, result)) = next else {
                 return;
             };
+            self.limits.note_round_trip(venue, took);
             match result {
                 Ok(mut routes) if !routes.is_empty() => {
                     let route = routes.swap_remove(0);
@@ -934,11 +953,10 @@ mod tests {
         }
         assert!(turned_away >= 3, "{turned_away} turned away");
         assert!(started.elapsed() < ms(900));
-        assert!(venues
-            .limits
-            .take_report()
-            .unwrap()
-            .contains("over_budget="));
+        let report = venues.limits.take_report().unwrap();
+        assert!(report.contains("over_budget="), "{report}");
+        // The venue's round trips are measured too.
+        assert!(report.contains("round_trip_ms p50/p90/max="), "{report}");
     }
 
     #[test]
