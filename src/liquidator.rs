@@ -7,7 +7,10 @@ use crate::{
     config::Eva01Config,
     execution::{
         activity::LiquidationActivity,
-        executor::{pushable_feed, BundleLanding, Executor, LostRace},
+        executor::{
+            apply_attempt_release, pushable_feed, AttemptOutcome, AttemptRelease, BundleLanding,
+            Executor, LostRace,
+        },
         inventory::InventoryStrategy,
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
@@ -15,7 +18,7 @@ use crate::{
     geyser::{AccountType, GeyserUpdate},
     health_watch::{self, HealthWatch, Watch, WatchedPosition},
     hot_list::{HotConfig, HotList, HotMode, Standing},
-    rebalancer::Rebalancer,
+    rebalancer::{liquidation_dex_gate, Rebalancer},
     tag_policy::{Balances, Candidate, TagPolicy},
     utils::{
         self,
@@ -499,6 +502,8 @@ pub struct Liquidator {
     /// The liquidation attempts the rebalancer stays out of the way of.
     activity: Arc<LiquidationActivity>,
     threads: Vec<JoinHandle<()>>,
+    /// Watches bundles after the relays accept them and releases those accounts.
+    settlement: Option<JoinHandle<()>>,
     tag_policy: TagPolicy,
     /// Tags due, sent from a thread of their own so the scan never waits on the RPC.
     tags: Sender<DueTag>,
@@ -837,7 +842,8 @@ impl Liquidator {
             activity.clone(),
         )?;
         let dex_client = rebalancer.liquidation_dex_client();
-        let dex_gate = rebalancer.dex_gate();
+        // Not the rebalancer's gate: a sweep must not hold a slot a liquidation quote is waiting on.
+        let dex_gate = Arc::new(liquidation_dex_gate());
 
         let rpc_client =
             RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
@@ -867,12 +873,13 @@ impl Liquidator {
         } else {
             None
         };
-        let executor = Executor::new(
+        let executor = Arc::new(Executor::new(
             rpc_client,
             cache.clone(),
             bundles,
             I80F48::from_num(config.wallet_min_profit_share),
-        );
+        ));
+        let queue = Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN));
 
         let strategy = InventoryStrategy::new(
             liquidator_account.clone(),
@@ -882,6 +889,8 @@ impl Liquidator {
             config.min_profit,
             reservations,
         )?;
+        let tags = spawn_tagger(liquidator_account.clone())?;
+        let settlement = Some(executor.start_settlement(Arc::clone(&queue)));
 
         let evaluator = Arc::new(Evaluator {
             cache: cache.clone(),
@@ -889,7 +898,6 @@ impl Liquidator {
             min_profit: config.min_profit,
             max_profit: config.max_profit,
         });
-        let queue = Arc::new(ExecutionQueue::new(ATTEMPT_COOLDOWN));
         let handoff = Arc::new(Handoff::new());
         let hot_config = HotConfig::from_env();
         info!(
@@ -918,13 +926,14 @@ impl Liquidator {
 
         Ok(Liquidator {
             rebalancer: Some(rebalancer),
-            executor: Arc::new(executor),
+            executor,
             strategy: Arc::new(strategy),
             evaluator,
             queue,
             activity,
             threads: Vec::new(),
-            tags: spawn_tagger(liquidator_account.clone())?,
+            settlement,
+            tags,
             tag_policy: TagPolicy::new(),
             skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
             health_watch: HealthWatch::default(),
@@ -1020,7 +1029,8 @@ impl Liquidator {
             self.report_scan_stats();
         }
 
-        // The workers exit once the queue stops; the rebalancer once the last worker is gone.
+        // Workers first, so an attempt still sending can hand its bundle to the watcher.
+        // The watcher then exits once its channel is dropped.
         info!("Stopping the liquidation workers and the rebalancer...");
         self.queue.stop();
         for thread in self.threads.drain(..) {
@@ -1031,6 +1041,12 @@ impl Liquidator {
         if let Some(thread) = self.ingest_thread.take() {
             if thread.join().is_err() {
                 error!("The update path panicked.");
+            }
+        }
+        self.executor.stop_settlement();
+        if let Some(thread) = self.settlement.take() {
+            if thread.join().is_err() {
+                error!("The settlement watcher panicked.");
             }
         }
         info!("The Liquidator loop is stopped.");
@@ -1549,19 +1565,22 @@ fn run_worker(
             attempt_liquidation(queued, queue, evaluator, executor, strategy, activity)
         }));
         // A panic cools down too, so it can't repeat in a tight loop.
-        let lost_race = attempt.unwrap_or_else(|_| {
+        let release = attempt.unwrap_or_else(|_| {
             error!("The liquidation attempt on {} panicked.", liquidatee);
-            false
+            AttemptRelease::Finished { landed_slot: None }
         });
-        match executor.landed_slot(attempt_id) {
-            Some(slot) => queue.release_after_landing(liquidatee, slot),
-            None if lost_race => queue.release_after_lost_race(liquidatee),
-            None => queue.release(liquidatee, true),
-        }
+        let release = match release {
+            AttemptRelease::Finished { landed_slot: None } => AttemptRelease::Finished {
+                landed_slot: executor.landed_slot(attempt_id),
+            },
+            other => other,
+        };
+        apply_attempt_release(queue, liquidatee, release);
     }
 }
 
-/// Whether the attempt lost a race (`LostRace`), which leaves nothing to wait for.
+/// How the queue should treat the account. `WatcherOwns` means the bundle was accepted and the
+/// settlement thread releases it.
 fn attempt_liquidation(
     QueuedIntent { intent, queued_at }: QueuedIntent,
     queue: &ExecutionQueue,
@@ -1569,7 +1588,7 @@ fn attempt_liquidation(
     executor: &Executor,
     strategy: &InventoryStrategy,
     activity: &LiquidationActivity,
-) -> bool {
+) -> AttemptRelease {
     let liquidatee = intent.liquidatee_account.address;
     // The intent was sized on the state at evaluation time. By now another liquidator may have
     // taken a chunk of the account or prices may have moved, so it is re-sized on the current
@@ -1605,13 +1624,18 @@ fn attempt_liquidation(
             queue.resized(&liquidatee, fresh.profit);
             let mut attempt = activity.attempt(liquidatee);
             match executor.try_execute(strategy, &fresh) {
-                Ok(()) => attempt.succeeded(),
+                Ok(AttemptOutcome::Settling) => return AttemptRelease::WatcherOwns,
+                Ok(AttemptOutcome::Finished) => attempt.succeeded(),
                 Err(e) => {
                     error!(
                         "LIQUIDATION_EXECUTION_FAILURE attempt_id={} account={} error={:#}",
                         fresh.attempt_id, liquidatee, e
                     );
-                    return e.downcast_ref::<LostRace>().is_some();
+                    return if e.downcast_ref::<LostRace>().is_some() {
+                        AttemptRelease::LostRace
+                    } else {
+                        AttemptRelease::Finished { landed_slot: None }
+                    };
                 }
             }
         }
@@ -1624,7 +1648,7 @@ fn attempt_liquidation(
             intent.attempt_id, liquidatee, e
         ),
     }
-    false
+    AttemptRelease::Finished { landed_slot: None }
 }
 
 /// Sells leftover tokens back to the swap mint and refills the inventory whenever a pass is due

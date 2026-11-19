@@ -30,14 +30,51 @@ use tokio::{
     sync::{Semaphore, SemaphorePermit},
 };
 
-/// Concurrent DEX operations allowed across the liquidation workers and the rebalancer. Each one
-/// costs several aggregator round-trips, so an unbounded burst trips the Jupiter rate limit (429)
-/// and the failing targets then sit in the executor's backoff.
-const MAX_CONCURRENT_DEX_CALLS: usize = 2;
-/// Minimum spacing between DEX operations starting. Two concurrent operations that each make
-/// two or three Jupiter requests still burst past its per-second gateway limit at startup; this
-/// keeps the request rate steady instead.
-const DEX_CALL_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// Concurrent DEX operations a gate admits by default. Each one costs several aggregator
+/// round-trips, so an unbounded burst trips the Jupiter rate limit (429) and the failing targets
+/// then sit in the executor's backoff.
+pub const DEFAULT_DEX_CONCURRENCY: usize = 2;
+/// Minimum spacing between DEX operations starting, by default. Two concurrent operations that each
+/// make two or three Jupiter requests still burst past its per-second gateway limit at startup;
+/// this keeps the request rate steady instead.
+pub const DEFAULT_DEX_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Liquidation quotes. Same concurrency as the rebalancer, but they start closer together so a
+/// worker is not paced like a sweep. `LIQ_DEX_CONCURRENCY` and `LIQ_DEX_MIN_INTERVAL_MS` override.
+pub const LIQ_DEX_CONCURRENCY: usize = DEFAULT_DEX_CONCURRENCY;
+pub const LIQ_DEX_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+fn env_millis(key: &str, default: Duration) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+/// The rebalancer's gate. `REBAL_DEX_CONCURRENCY` and `REBAL_DEX_MIN_INTERVAL_MS` override.
+pub fn rebalancer_dex_gate() -> DexGate {
+    DexGate::new(
+        env_usize("REBAL_DEX_CONCURRENCY", DEFAULT_DEX_CONCURRENCY),
+        env_millis("REBAL_DEX_MIN_INTERVAL_MS", DEFAULT_DEX_MIN_INTERVAL),
+    )
+}
+
+/// The liquidation workers' gate. Not the rebalancer's.
+pub fn liquidation_dex_gate() -> DexGate {
+    DexGate::new(
+        env_usize("LIQ_DEX_CONCURRENCY", LIQ_DEX_CONCURRENCY),
+        env_millis("LIQ_DEX_MIN_INTERVAL_MS", LIQ_DEX_MIN_INTERVAL),
+    )
+}
 
 /// How long the other venues still get once one returns a quote that covers a liquidation.
 const LIQUIDATION_QUOTE_GRACE: Duration = Duration::from_millis(100);
@@ -45,18 +82,25 @@ const LIQUIDATION_QUOTE_GRACE: Duration = Duration::from_millis(100);
 /// How long a swap venue gets to quote, or to build its route, before it is left out.
 const SWAP_VENUE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Admission to the DEX aggregators: at most [`MAX_CONCURRENT_DEX_CALLS`] operations in flight,
-/// starting no closer together than [`DEX_CALL_MIN_INTERVAL`].
+/// Admission to the DEX aggregators: at most `max_concurrent` operations in flight, starting no
+/// closer together than `min_interval`. Liquidations and the rebalancer each have a gate of their
+/// own, so a rebalancing swap never holds a slot a liquidation's quote is waiting for.
 pub struct DexGate {
     semaphore: Semaphore,
+    min_interval: Duration,
     last_grant: tokio::sync::Mutex<Instant>,
 }
 
 impl DexGate {
-    fn new() -> Self {
+    pub fn new(max_concurrent: usize, min_interval: Duration) -> Self {
         Self {
-            semaphore: Semaphore::new(MAX_CONCURRENT_DEX_CALLS),
-            last_grant: tokio::sync::Mutex::new(Instant::now() - DEX_CALL_MIN_INTERVAL),
+            semaphore: Semaphore::new(max_concurrent.max(1)),
+            min_interval,
+            last_grant: tokio::sync::Mutex::new(
+                Instant::now()
+                    .checked_sub(min_interval)
+                    .unwrap_or_else(Instant::now),
+            ),
         }
     }
 
@@ -65,8 +109,8 @@ impl DexGate {
         let permit = self.semaphore.acquire().await?;
         let mut last_grant = self.last_grant.lock().await;
         let since = last_grant.elapsed();
-        if since < DEX_CALL_MIN_INTERVAL {
-            tokio::time::sleep(DEX_CALL_MIN_INTERVAL - since).await;
+        if since < self.min_interval {
+            tokio::time::sleep(self.min_interval - since).await;
         }
         *last_grant = Instant::now();
         Ok(permit)
@@ -263,7 +307,7 @@ impl Rebalancer {
             cache,
             dex_client,
             liquidation_dex_client,
-            dex_gate: Arc::new(DexGate::new()),
+            dex_gate: Arc::new(rebalancer_dex_gate()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
             held_stake: HashMap::new(),
@@ -286,10 +330,6 @@ impl Rebalancer {
     /// The swap client liquidations quote and build on.
     pub fn liquidation_dex_client(&self) -> Arc<DexSuperAggClient> {
         Arc::clone(&self.liquidation_dex_client)
-    }
-
-    pub fn dex_gate(&self) -> Arc<DexGate> {
-        Arc::clone(&self.dex_gate)
     }
 
     /// Bring every inventory token back into its band, and sell every other unclaimed token the
@@ -1013,5 +1053,19 @@ mod tests {
             println!("{line}");
         }
         assert!(sim.err.is_none());
+    }
+
+    #[tokio::test]
+    async fn two_dex_gates_do_not_share_a_semaphore() {
+        let liquidation = DexGate::new(1, Duration::ZERO);
+        let rebalancer = DexGate::new(1, Duration::ZERO);
+        let _held = liquidation.acquire().await.expect("liquidation slot");
+        let started = Instant::now();
+        let other = tokio::time::timeout(Duration::from_millis(200), rebalancer.acquire()).await;
+        assert!(
+            other.is_ok(),
+            "the rebalancer gate blocked on the liquidation gate"
+        );
+        assert!(started.elapsed() < Duration::from_millis(150));
     }
 }

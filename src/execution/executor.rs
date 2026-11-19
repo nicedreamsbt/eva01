@@ -1,7 +1,8 @@
 //! Submission + orchestration engine for the execution layer.
 //!
-//! `try_execute()` turns a prepared liquidation into a landed liquidation, always one liquidation
-//! transaction, fastest first:
+//! `try_execute()` turns a prepared liquidation into one liquidation transaction, fastest first.
+//! A bundle that the relays accept is handed to the settlement watcher; the worker does not wait
+//! for it to land. Refusals still fail on the worker.
 //! 1. repaid from the wallet's holdings, when that earns enough of the profit: no swap quote. It
 //!    claims the tokens it repays with until it has landed or failed and the wallet balances have
 //!    been re-read;
@@ -19,7 +20,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -50,7 +54,18 @@ use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 
-use super::{inventory::WalletClaimed, ExecutionPlan, Landing, LiquidationStrategy, Sandwich};
+use super::{
+    inventory::WalletClaimed, queue::ExecutionQueue, Claim, ExecutionPlan, Landing,
+    LiquidationStrategy, Sandwich,
+};
+
+/// What `try_execute` did. `Settling` means the bundle was accepted and a watcher owns the
+/// account until it lands or is lost; the worker must not release it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Finished,
+    Settling,
+}
 
 /// How often a watched bundle's status is asked of the block engine, in a spare request slot: a
 /// lost bundle is known within a slot or two, and its account may go again at once.
@@ -350,13 +365,16 @@ enum SignatureState {
     Unreadable,
 }
 
-/// The bundles a liquidation went out in, as far as telling whether it landed goes.
-struct InFlight<'a> {
-    /// The block engine took it; with its id unless already processed.
-    jito: Option<Option<(&'a JitoClient, &'a str)>>,
-    /// The request to the block engine got no usable answer: the bundle may have arrived, with no
-    /// id to ask about, so it gets [`SENDER_LANDING_WINDOW`] like Sender's.
+/// The bundles a liquidation went out in, owned so a watcher thread can settle it after the
+/// worker has moved on.
+struct OwnedWatch {
+    /// A real block-engine bundle id. Absent for "0x0" (already processed) and for no id at all.
+    jito_bundle_id: Option<String>,
+    /// The request to the block engine got no usable answer, or the id was "0x0": the bundle may
+    /// have arrived, with nothing to ask about, so it gets [`SENDER_LANDING_WINDOW`].
     jito_uncertain: bool,
+    /// No block-engine copy was sent and the send was not uncertain, so that copy starts lost.
+    jito_absent: bool,
     /// Sender took it: its tip transaction's signature, which lands only with Sender's bundle.
     sender_tip: Option<Signature>,
     /// Sender took it, or may have: watched for [`SENDER_LANDING_WINDOW`] even without a
@@ -364,14 +382,59 @@ struct InFlight<'a> {
     sender_in_flight: bool,
 }
 
+/// A bundle the relays accepted. The worker returns immediately; the settlement watcher finishes it.
+struct SettlementJob {
+    attempt_id: u64,
+    liquidatee: Pubkey,
+    liquidation_sig: Signature,
+    blockhash: Hash,
+    watch: OwnedWatch,
+    claim: Option<Claim>,
+    alone: bool,
+    /// Push or refresh sits ahead of the liquidation, so a simulation of it alone does not explain a loss.
+    behind_others: bool,
+    bundle: Vec<VersionedTransaction>,
+}
+
+/// A bundle the relays accepted, ready for the settlement watcher.
+struct AcceptedSend {
+    liquidation_sig: Signature,
+    blockhash: Hash,
+    watch: OwnedWatch,
+}
+
 /// What became of a bundle sent to the block engine and Helius Sender.
 enum BundleOutcome {
-    /// At this slot.
-    Landed(u64),
-    /// Accepted for the auction (or possibly so) and didn't land: lost, or failed unseen.
-    NotLanded,
+    /// Accepted (or possibly so). Not yet landed: the watcher owns it.
+    Accepted(AcceptedSend),
     /// Refused or never delivered: it took no part in an auction.
     Refused,
+}
+
+fn finished(result: Result<()>) -> Result<AttemptOutcome> {
+    result.map(|()| AttemptOutcome::Finished)
+}
+
+/// How the worker releases the queue after `try_execute`. `WatcherOwns` releases nothing.
+pub(crate) enum AttemptRelease {
+    WatcherOwns,
+    LostRace,
+    Finished { landed_slot: Option<u64> },
+}
+
+pub(crate) fn apply_attempt_release(
+    queue: &ExecutionQueue,
+    address: Pubkey,
+    release: AttemptRelease,
+) {
+    match release {
+        AttemptRelease::WatcherOwns => {}
+        AttemptRelease::LostRace => queue.release_after_lost_race(address),
+        AttemptRelease::Finished {
+            landed_slot: Some(slot),
+        } => queue.release_after_landing(address, slot),
+        AttemptRelease::Finished { landed_slot: None } => queue.release(address, true),
+    }
 }
 
 /// A wallet repay needs no quote and no route, so it goes before a sandwich on another pair unless
@@ -409,6 +472,11 @@ pub struct Executor {
     bundles: Option<BundleLanding>,
     /// The share of its pair's full profit a wallet-funded plan must earn more than to go first.
     wallet_min_profit_share: I80F48,
+    /// Accepted bundles waiting for the settlement watcher. `None` until it is started, and again
+    /// after it is stopped; a send then settles on the worker, as before.
+    settle_tx: Mutex<Option<mpsc::Sender<SettlementJob>>>,
+    /// Set on shutdown so a watch in progress stops polling and releases the account.
+    settle_stop: AtomicBool,
 }
 
 impl Executor {
@@ -428,7 +496,129 @@ impl Executor {
             no_routes: Mutex::new(HashMap::new()),
             bundles,
             wallet_min_profit_share,
+            settle_tx: Mutex::new(None),
+            settle_stop: AtomicBool::new(false),
         }
+    }
+
+    /// Starts the thread that watches accepted bundles and releases their accounts. One watcher;
+    /// starting again replaces the channel and the previous thread exits when it next receives.
+    pub fn start_settlement(
+        self: &Arc<Self>,
+        queue: Arc<ExecutionQueue>,
+    ) -> thread::JoinHandle<()> {
+        let (tx, rx) = mpsc::channel();
+        *self
+            .settle_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        self.settle_stop.store(false, Ordering::SeqCst);
+        let executor = Arc::clone(self);
+        thread::Builder::new()
+            .name("settlement".into())
+            .spawn(move || executor.watch_settlements(queue, rx))
+            .expect("settlement watcher thread")
+    }
+
+    /// Drops the job channel and asks a watch in progress to stop. The caller joins the thread.
+    pub fn stop_settlement(&self) {
+        self.settle_stop.store(true, Ordering::SeqCst);
+        *self
+            .settle_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn enqueue_settlement(&self, job: SettlementJob) -> Result<(), SettlementJob> {
+        let guard = self.settle_tx.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = guard.as_ref() else {
+            return Err(job);
+        };
+        tx.send(job).map_err(|sent| sent.0)
+    }
+
+    fn watch_settlements(&self, queue: Arc<ExecutionQueue>, rx: mpsc::Receiver<SettlementJob>) {
+        while let Ok(job) = rx.recv() {
+            let liquidatee = job.liquidatee;
+            let attempt_id = job.attempt_id;
+            let result = self.finish_job(job);
+            match &result {
+                Ok(()) => match self.landed_slot(attempt_id) {
+                    Some(slot) => queue.release_after_landing(liquidatee, slot),
+                    None => queue.release(liquidatee, true),
+                },
+                Err(e) if e.downcast_ref::<LostRace>().is_some() => {
+                    queue.release_after_lost_race(liquidatee);
+                }
+                Err(_) => queue.release(liquidatee, true),
+            }
+        }
+    }
+
+    /// Polls until the bundle lands or is lost, then refreshes a wallet claim and records the slot.
+    /// Does not touch the execution queue.
+    fn finish_job(&self, job: SettlementJob) -> Result<()> {
+        let SettlementJob {
+            attempt_id,
+            liquidatee,
+            liquidation_sig,
+            blockhash,
+            watch,
+            claim,
+            alone,
+            behind_others,
+            bundle,
+        } = job;
+        let result = match self.landed_before_expiry(
+            attempt_id,
+            &liquidation_sig,
+            &blockhash,
+            &watch,
+        ) {
+            Ok(Some(slot)) => {
+                self.landed_slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(attempt_id, slot);
+                Ok(())
+            }
+            Ok(None) => Err(LostRace(String::new()).into()),
+            Err(e) => Err(e),
+        };
+        // A sandwich claims no wallet tokens, and a bundle that never went out spent none.
+        let sent = !result.as_ref().is_err_and(|e| {
+            e.downcast_ref::<NoRelay>().is_some() || e.downcast_ref::<NotSent>().is_some()
+        });
+        if claim.is_some() && sent {
+            self.refresh_wallet_balances();
+        }
+        drop(claim);
+        let result = match result {
+            Err(e) if e.downcast_ref::<LostRace>().is_some() => Err(LostRace(format!(
+                "the bundle for {liquidatee} didn't land: {}",
+                self.why_not_landed(&bundle, behind_others)
+            ))
+            .into()),
+            result => result,
+        };
+        match &result {
+            Ok(()) => {
+                self.clear_target_backoff(&liquidatee);
+                self.recent_landings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(liquidatee, Instant::now());
+            }
+            Err(e)
+                if alone
+                    && is_premium_cap_failure(&e.to_string())
+                    && !self.landed_lately(&liquidatee) =>
+            {
+                self.hold(&liquidatee, PREMIUM_CAP_HOLD, "premium cap")
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// The slot attempt `attempt_id`, which just returned, landed at, when it went as a bundle;
@@ -450,7 +640,7 @@ impl Executor {
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
-    ) -> Result<()> {
+    ) -> Result<AttemptOutcome> {
         // A target that failed recently (rate limit, no plan, a lost bundle) is backed off before
         // any quote is spent; the backoff expires so a recovering target retries.
         if self.is_backed_off(&intent.liquidatee_account.address)? {
@@ -458,7 +648,7 @@ impl Executor {
                 "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=skipped reason=backed_off",
                 intent.attempt_id, intent.liquidatee_account.address
             );
-            return Ok(());
+            return Ok(AttemptOutcome::Finished);
         }
         if let Some(push) = &intent.push {
             let oracle_state: Vec<String> = push
@@ -492,8 +682,14 @@ impl Executor {
         let started = Instant::now();
         let result = self.try_execute_inner(strategy, intent);
         match &result {
-            Ok(()) => info!(
+            Ok(AttemptOutcome::Finished) => info!(
                 "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=success elapsed_ms={}",
+                intent.attempt_id,
+                intent.liquidatee_account.address,
+                started.elapsed().as_millis()
+            ),
+            Ok(AttemptOutcome::Settling) => info!(
+                "LIQUIDATION_ATTEMPT_END attempt_id={} account={} outcome=settling elapsed_ms={}",
                 intent.attempt_id,
                 intent.liquidatee_account.address,
                 started.elapsed().as_millis()
@@ -512,7 +708,7 @@ impl Executor {
         &self,
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
-    ) -> Result<()> {
+    ) -> Result<AttemptOutcome> {
         let liab_mint = self.intent_liab_mint(intent)?;
 
         // The evaluation sized the liquidation on the prices its push posts, which go out first.
@@ -641,11 +837,16 @@ impl Executor {
         strategy: &dyn LiquidationStrategy,
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
-    ) -> Result<()> {
+    ) -> Result<AttemptOutcome> {
         let liquidatee = intent.liquidatee_account.address;
         let wallet_short = match self.sufficient_wallet_plan(strategy, intent, Landing::Rpc) {
             Ok(plan) => {
-                return self.land_wallet_plan(&liquidatee, intent.attempt_id, plan, Preflight::Run)
+                return finished(self.land_wallet_plan(
+                    &liquidatee,
+                    intent.attempt_id,
+                    plan,
+                    Preflight::Run,
+                ))
             }
             Err(short) => short,
         };
@@ -663,19 +864,19 @@ impl Executor {
                 );
                 let result = self.send_over_rpc(&tx, "Sandwich", Preflight::Skip);
                 self.note_result(&liquidatee, &result);
-                result
+                finished(result)
             }
             no_sandwich => {
                 // What the wallet funds is better than nothing when no sandwich can go.
                 if let Some(plan) = self.partial_wallet_plan(strategy, intent, Landing::Rpc) {
-                    return self.land_wallet_plan(
+                    return finished(self.land_wallet_plan(
                         &liquidatee,
                         intent.attempt_id,
                         plan,
                         Preflight::Run,
-                    );
+                    ));
                 }
-                self.no_plan(&liquidatee, liab_mint, &wallet_short, no_sandwich)
+                finished(self.no_plan(&liquidatee, liab_mint, &wallet_short, no_sandwich))
             }
         }
     }
@@ -685,7 +886,7 @@ impl Executor {
         &self,
         strategy: &dyn LiquidationStrategy,
         unpushed: &PreparedLiquidatableAccount,
-    ) -> Result<()> {
+    ) -> Result<AttemptOutcome> {
         let liquidatee = unpushed.liquidatee_account.address;
         let liab_mint = self.intent_liab_mint(unpushed)?;
         info!("Liquidating {liquidatee} without a push, on the chain's prices: the push can't go");
@@ -861,7 +1062,7 @@ impl Executor {
         intent: &PreparedLiquidatableAccount,
         liab_mint: Pubkey,
         push: Option<&PushedPrices>,
-    ) -> Result<()> {
+    ) -> Result<AttemptOutcome> {
         let liquidatee = intent.liquidatee_account.address;
         let bundles = self
             .bundles
@@ -995,13 +1196,13 @@ impl Executor {
                         send,
                     );
                 }
-                self.no_plan(&liquidatee, liab_mint, &wallet_short, no_sandwich)
+                finished(self.no_plan(&liquidatee, liab_mint, &wallet_short, no_sandwich))
             }
         }
     }
 
-    /// Sends `[push..] [refresh] [liquidation] [tip]`, the tip a share of the plan's profit, and
-    /// settles it.
+    /// Sends `[push..] [refresh] [liquidation] [tip]`, the tip a share of the plan's profit.
+    /// Once a relay accepts it, the settlement watcher owns the landing and the queue release.
     #[allow(clippy::too_many_arguments)]
     fn land_bundle(
         &self,
@@ -1013,7 +1214,7 @@ impl Executor {
         plan: ExecutionPlan,
         kind: &str,
         send: u64,
-    ) -> Result<()> {
+    ) -> Result<AttemptOutcome> {
         let liquidatee = intent.liquidatee_account.address;
         let ExecutionPlan { tx, claim, profit } = plan;
         let profit_lamports = strategy.lamports_for_value(profit).unwrap_or_else(|e| {
@@ -1075,7 +1276,7 @@ impl Executor {
         } else {
             Some(bundles.jito.reserve())
         };
-        let result = match self.send_bundle(
+        let sent = match self.send_bundle(
             intent.attempt_id,
             bundles,
             &bundle,
@@ -1084,67 +1285,41 @@ impl Executor {
             slot,
             jito_down,
         ) {
-            Ok(BundleOutcome::Landed(slot)) => {
-                self.landed_slots
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(intent.attempt_id, slot);
-                Ok(())
+            Ok(outcome) => outcome,
+            Err(e) if e.downcast_ref::<BuildFailure>().is_some() => {
+                return Err(
+                    NotSent(format!("the bundle for {liquidatee} wasn't sent: {e}")).into(),
+                );
             }
-            // Why is asked after the claim is released, below: it costs a simulation.
-            Ok(BundleOutcome::NotLanded) => Err(LostRace(String::new()).into()),
-            Ok(BundleOutcome::Refused) if jito_down => Err(NoRelay(format!(
+            Err(e) => return Err(e),
+        };
+        match sent {
+            BundleOutcome::Refused if jito_down => Err(NoRelay(format!(
                 "the bundle for {liquidatee} wasn't sent: the block engine is down and Sender didn't take it"
             ))
             .into()),
-            Ok(BundleOutcome::Refused) => {
+            BundleOutcome::Refused => {
                 Err(NotSent(format!("the bundle for {liquidatee} wasn't sent")).into())
             }
-            Err(e) if e.downcast_ref::<BuildFailure>().is_some() => {
-                Err(NotSent(format!("the bundle for {liquidatee} wasn't sent: {e}")).into())
+            BundleOutcome::Accepted(accepted) => {
+                let job = SettlementJob {
+                    attempt_id: intent.attempt_id,
+                    liquidatee,
+                    liquidation_sig: accepted.liquidation_sig,
+                    blockhash: accepted.blockhash,
+                    watch: accepted.watch,
+                    claim,
+                    alone,
+                    behind_others: push.is_some() || behind_refresh,
+                    bundle,
+                };
+                match self.enqueue_settlement(job) {
+                    Ok(()) => Ok(AttemptOutcome::Settling),
+                    // No watcher (tests, or shutdown): settle on this thread, as before.
+                    Err(job) => finished(self.finish_job(job)),
+                }
             }
-            Err(e) => Err(e),
-        };
-        // A sandwich claims no wallet tokens, and a bundle that never went out spent none: nothing
-        // waits for the balances to be re-read.
-        let sent = !result.as_ref().is_err_and(|e| {
-            e.downcast_ref::<NoRelay>().is_some() || e.downcast_ref::<NotSent>().is_some()
-        });
-        if claim.is_some() && sent {
-            self.refresh_wallet_balances();
         }
-        drop(claim);
-        let result = match result {
-            Err(e) if e.downcast_ref::<LostRace>().is_some() => Err(LostRace(format!(
-                "the bundle for {liquidatee} didn't land: {}",
-                self.why_not_landed(&bundle, push.is_some() || behind_refresh)
-            ))
-            .into()),
-            result => result,
-        };
-        // A bundle that didn't land costs nothing and holds nothing back: the account is evaluated
-        // afresh. Only the premium cap holds it, as retrying the same sizing fails the same way.
-        match &result {
-            Ok(()) => {
-                self.clear_target_backoff(&liquidatee);
-                self.recent_landings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(liquidatee, Instant::now());
-            }
-            // Only when the liquidation went alone does its simulation tell; and not just after
-            // another attempt on the account landed, which restarts its premium's growth: this
-            // one was sized on the grown premium, the next is sized on the new one.
-            Err(e)
-                if alone
-                    && is_premium_cap_failure(&e.to_string())
-                    && !self.landed_lately(&liquidatee) =>
-            {
-                self.hold(&liquidatee, PREMIUM_CAP_HOLD, "premium cap")
-            }
-            Err(_) => {}
-        }
-        result
     }
 
     /// `push` built again with Sender's tip in one of its transactions, so Sender's bundle has
@@ -1321,22 +1496,22 @@ impl Executor {
             liquidation_sig,
             bundle.len().saturating_sub(1)
         );
-        let in_flight = InFlight {
-            // "0x0": already processed, so there's no bundle to ask about; the liquidation's
-            // signature settles it.
-            jito: jito_id
-                .as_deref()
-                .map(|id| (id != "0x0").then_some((&bundles.jito, id))),
-            jito_uncertain,
-            sender_tip,
-            sender_in_flight,
-        };
-        Ok(
-            match self.landed_before_expiry(attempt_id, &liquidation_sig, &blockhash, in_flight)? {
-                Some(slot) => BundleOutcome::Landed(slot),
-                None => BundleOutcome::NotLanded,
+        // "0x0": already processed, so there's no bundle to ask about; the liquidation's
+        // signature settles it. The worker returns here; the watcher polls.
+        Ok(BundleOutcome::Accepted(AcceptedSend {
+            liquidation_sig,
+            blockhash,
+            watch: OwnedWatch {
+                jito_bundle_id: jito_id
+                    .as_ref()
+                    .filter(|id| id.as_str() != "0x0")
+                    .cloned(),
+                jito_uncertain,
+                jito_absent: jito_id.is_none() && !jito_uncertain,
+                sender_tip,
+                sender_in_flight,
             },
-        )
+        }))
     }
 
     /// The slot `sig` lands at while its `blockhash` is valid, if it does. Until settled, the caller
@@ -1349,16 +1524,19 @@ impl Executor {
         attempt_id: u64,
         sig: &Signature,
         blockhash: &Hash,
-        in_flight: InFlight<'_>,
+        watch: &OwnedWatch,
     ) -> Result<Option<u64>> {
         let started = Instant::now();
         let mut last_inflight_check = Instant::now();
-        let check_interval = match in_flight.jito {
-            Some(Some((jito, _))) if jito.capacity() < 2 => INFLIGHT_CHECK_INTERVAL_UNAUTHENTICATED,
+        let check_interval = match (
+            watch.jito_bundle_id.is_some(),
+            self.bundles.as_ref().map(|bundles| bundles.jito.capacity()),
+        ) {
+            (true, Some(capacity)) if capacity < 2 => INFLIGHT_CHECK_INTERVAL_UNAUTHENTICATED,
             _ => INFLIGHT_CHECK_INTERVAL,
         };
         // The block engine's copy can't land: never sent, or reported failed.
-        let mut jito_lost = in_flight.jito.is_none() && !in_flight.jito_uncertain;
+        let mut jito_lost = watch.jito_absent && !watch.jito_uncertain;
         // When the liquidation was first seen processed, and at which slot last: once seen, it is
         // landing until its fork is shown gone, whatever a lagging node answers next.
         let mut seen_processed: Option<(Instant, u64)> = None;
@@ -1370,7 +1548,7 @@ impl Executor {
         let mut polls: u32 = 0;
         let mut valid = true;
         let mut watched = vec![*sig];
-        watched.extend(in_flight.sender_tip);
+        watched.extend(watch.sender_tip);
         let landed = |slot: u64, via_sender: bool| {
             let via = if via_sender { Path::Sender } else { Path::Jito };
             info!(
@@ -1380,6 +1558,13 @@ impl Executor {
             Some(slot)
         };
         loop {
+            if self.settle_stop.load(Ordering::Relaxed) {
+                warn!(
+                    "LIQUIDATION_BUNDLE_LOST attempt_id={attempt_id} liquidation_signature={sig} elapsed_ms={} reason=shutting down",
+                    started.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
             let (state, via_sender) = self.signature_states(&watched);
             match state {
                 SignatureState::Confirmed(slot) => return Ok(landed(slot, via_sender)),
@@ -1396,19 +1581,25 @@ impl Executor {
             } else if unreadable_since.is_none() {
                 unreadable_since = Some(Instant::now());
             }
-            if let Some(Some((jito, id))) = in_flight.jito {
+            if let Some(id) = watch.jito_bundle_id.as_deref() {
+                let jito_down = self
+                    .bundles
+                    .as_ref()
+                    .is_some_and(|bundles| bundles.jito.is_down());
                 // A block engine taken as down isn't asked: it would only cost the timeout.
                 if !jito_lost
-                    && !jito.is_down()
+                    && !jito_down
                     && last_inflight_check.elapsed() >= check_interval
                     && started.elapsed() < WATCH_MAX_WAIT
                 {
                     last_inflight_check = Instant::now();
                     // Only in a spare slot: sends need them more.
-                    if let Some(status) = jito
-                        .try_reserve_spare()
-                        .and_then(|slot| slot.inflight_bundle_status(id).ok().flatten())
-                    {
+                    if let Some(status) = self.bundles.as_ref().and_then(|bundles| {
+                        bundles
+                            .jito
+                            .try_reserve_spare()
+                            .and_then(|slot| slot.inflight_bundle_status(id).ok().flatten())
+                    }) {
                         last_jito_answer = Instant::now();
                         jito_lost = status.is_dead();
                         jito_reported_dead = status.is_dead();
@@ -1424,11 +1615,10 @@ impl Executor {
                     jito_lost = true;
                 }
             }
-            if in_flight.jito_uncertain && started.elapsed() >= SENDER_LANDING_WINDOW {
+            if watch.jito_uncertain && started.elapsed() >= SENDER_LANDING_WINDOW {
                 jito_lost = true;
             }
-            let sender_lost =
-                !in_flight.sender_in_flight || started.elapsed() >= SENDER_LANDING_WINDOW;
+            let sender_lost = !watch.sender_in_flight || started.elapsed() >= SENDER_LANDING_WINDOW;
             // The blockhash is checked every few polls (it lives ~32 s), not before every one.
             polls += 1;
             if polls.is_multiple_of(BLOCKHASH_CHECK_EVERY) && started.elapsed() < WATCH_MAX_WAIT {
@@ -1445,8 +1635,8 @@ impl Executor {
                 rpc_unreadable_long: unreadable_since
                     .is_some_and(|at| at.elapsed() >= UNREADABLE_WHEN_LOST),
                 only_jito_dead: jito_reported_dead
-                    && !in_flight.sender_in_flight
-                    && !in_flight.jito_uncertain,
+                    && !watch.sender_in_flight
+                    && !watch.jito_uncertain,
                 // The fork of what the chain showed processed, or else of the slot the block
                 // engine reported it landed at.
                 fork_abandoned: match (seen_processed, jito_landed, jito_landed_at) {
@@ -2013,5 +2203,51 @@ mod tests {
             "Error Code: LiquidationPremiumTooHigh. Error Number: 6090."
         ));
         assert!(!is_premium_cap_failure("custom program error: 0x17b4"));
+    }
+
+    #[test]
+    fn an_accepted_bundle_leaves_the_account_in_flight_until_settlement() {
+        use crate::execution::queue::intent_for_test;
+        let queue = Arc::new(ExecutionQueue::new(Duration::from_secs(30)));
+        let address = Pubkey::new_unique();
+        queue.offer(&[address], vec![intent_for_test(address, 4)]);
+        assert!(queue.take().is_some());
+
+        let started = Instant::now();
+        apply_attempt_release(&queue, address, AttemptRelease::WatcherOwns);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "handing the account to the watcher does not wait"
+        );
+        queue.offer(&[address], vec![intent_for_test(address, 4)]);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let second = thread::spawn({
+            let queue = Arc::clone(&queue);
+            move || {
+                ready_tx.send(()).ok();
+                queue.take()
+            }
+        });
+        ready_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !second.is_finished(),
+            "a second take waits while the bundle is settling"
+        );
+
+        queue.release_after_lost_race(address);
+        let taken = second.join().unwrap().expect("released after settlement");
+        assert_eq!(taken.intent.liquidatee_account.address, address);
+    }
+
+    #[test]
+    fn the_settlement_watcher_exits_when_its_channel_is_dropped() {
+        let executor = Arc::new(executor());
+        let queue = Arc::new(ExecutionQueue::new(Duration::ZERO));
+        let handle = executor.start_settlement(Arc::clone(&queue));
+        let started = Instant::now();
+        executor.stop_settlement();
+        handle.join().expect("settlement watcher");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
