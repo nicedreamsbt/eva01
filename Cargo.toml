@@ -13,7 +13,7 @@ idl-build = []
 nds = ["dep:nds-client"]
 
 [target.'cfg(unix)'.dependencies]
-nds-client = { git = "https://github.com/nicedreamsbt/nicedreamswap", rev = "09db31be4d9e12c912607397ca2f75c733197628", optional = true }
+nds-client = { git = "https://github.com/nicedreamsbt/nicedreamswap", rev = "b2d774084c199496100a3139ce07ac5d74b2c75e", optional = true }
 
 [dependencies]
 solana-account = { version = "4", features = ["bincode"] }

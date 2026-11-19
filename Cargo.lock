@@ -1804,6 +1804,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "warp",
+ "wincode",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
@@ -3186,7 +3187,7 @@ dependencies = [
 [[package]]
 name = "nds-client"
 version = "0.1.0"
-source = "git+https://github.com/nicedreamsbt/nicedreamswap?rev=09db31be4d9e12c912607397ca2f75c733197628#09db31be4d9e12c912607397ca2f75c733197628"
+source = "git+https://github.com/nicedreamsbt/nicedreamswap?rev=b2d774084c199496100a3139ce07ac5d74b2c75e#b2d774084c199496100a3139ce07ac5d74b2c75e"
 dependencies = [
  "anyhow",
  "nds-proto",
@@ -3197,7 +3198,7 @@ dependencies = [
 [[package]]
 name = "nds-proto"
 version = "0.1.0"
-source = "git+https://github.com/nicedreamsbt/nicedreamswap?rev=09db31be4d9e12c912607397ca2f75c733197628#09db31be4d9e12c912607397ca2f75c733197628"
+source = "git+https://github.com/nicedreamsbt/nicedreamswap?rev=b2d774084c199496100a3139ce07ac5d74b2c75e#b2d774084c199496100a3139ce07ac5d74b2c75e"
 dependencies = [
  "bincode",
  "serde",
