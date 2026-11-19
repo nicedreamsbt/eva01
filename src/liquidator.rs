@@ -2222,7 +2222,7 @@ impl Evaluator {
             let (assets, liabilities) = health_components(
                 account,
                 group,
-                &clock,
+                &cache.clock_not_before(&clock),
                 banks_and_oracles,
                 &mut accounts,
                 RequirementType::Maintenance,
@@ -2365,6 +2365,8 @@ impl Evaluator {
         liab_banks: &[Pubkey],
     ) -> Result<PairSearch> {
         let mut accounts = program_accounts(cache, banks_and_oracles, pricing)?;
+        // Read after the oracle accounts were copied, so it covers every price in them.
+        let clock = cache.clock_not_before(&clock);
         let mut bank_to_emode_config = HashMap::<Pubkey, EmodeConfig>::new();
         for pk in banks_and_oracles {
             if let Ok(wrapper) = cache.banks.try_get_bank(pk) {

@@ -209,6 +209,8 @@ impl OracleWrapper {
             .map(|(address, account)| (address, account).into_account_info())
             .collect();
 
+        // Read after the accounts above, so it covers every price in them (see `clock_not_before`).
+        let clock = &cache.clock_not_before(clock);
         let source = OraclePriceFeedAdapter::try_from_bank(bank, &remaining_ais, clock, false)?;
 
         Ok(Self { source })

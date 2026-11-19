@@ -97,6 +97,18 @@ impl Cache {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `clock`, or the shared clock when that is later: for evaluating on oracle accounts read from the
+    /// cache a moment ago. The update thread moves the shared clock up to a Scope price's timestamp
+    /// before it stores the price, so a clock read after the price always covers it; one read before
+    /// (a cycle's snapshot, while updates keep arriving) can be behind it, and marginfi then rejects the
+    /// entry as dated in the future.
+    pub fn clock_not_before(&self, clock: &Clock) -> Clock {
+        match clock_manager::get_clock(&self.clock) {
+            Ok(shared) if shared.unix_timestamp > clock.unix_timestamp => shared,
+            _ => clock.clone(),
+        }
+    }
+
     pub fn set_liquidation_max_fee(&self, fee: I80F48) {
         *self
             .liquidation_max_fee
@@ -181,5 +193,55 @@ impl Cache {
             }
         }
         Ok(read_at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_at(timestamp: i64) -> Cache {
+        Cache::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Arc::new(Mutex::new(Clock {
+                unix_timestamp: timestamp,
+                ..Clock::default()
+            })),
+            HashSet::new(),
+        )
+    }
+
+    fn at(timestamp: i64) -> Clock {
+        Clock {
+            unix_timestamp: timestamp,
+            ..Clock::default()
+        }
+    }
+
+    #[test]
+    fn an_evaluation_clock_is_never_behind_the_shared_one() {
+        let cache = cache_at(1_000);
+        // A snapshot older than the shared clock is brought up to it...
+        assert_eq!(cache.clock_not_before(&at(990)).unix_timestamp, 1_000);
+        // ...one at or ahead of it is kept.
+        assert_eq!(cache.clock_not_before(&at(1_000)).unix_timestamp, 1_000);
+        assert_eq!(cache.clock_not_before(&at(1_010)).unix_timestamp, 1_010);
+    }
+
+    #[test]
+    fn a_price_stored_after_a_cycle_began_is_covered_by_a_clock_read_afterwards() {
+        let cache = cache_at(1_000);
+        // A background cycle takes its snapshot.
+        let snapshot = at(cache.clock.lock().unwrap().unix_timestamp);
+        // The update thread then stores a Scope price dated 1_003: it moves the shared clock up to
+        // the price's timestamp first, then stores the price.
+        crate::clock_manager::advance_to(&cache.clock, 1_003).unwrap();
+        let price_timestamp = 1_003;
+
+        // The snapshot alone would call that price dated in the future...
+        assert!(price_timestamp > snapshot.unix_timestamp);
+        // ...a clock read after the price is stored does not.
+        assert!(cache.clock_not_before(&snapshot).unix_timestamp >= price_timestamp);
     }
 }
