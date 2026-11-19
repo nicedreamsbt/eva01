@@ -211,6 +211,9 @@ struct ScanStats {
     /// The same, to the cycle finishing: the whole time from a change to every affected account
     /// being evaluated and any liquidation queued.
     detections: Vec<Duration>,
+    /// For each liquidation this path queued after an update, how long after the oldest update behind
+    /// it arrived: the number to set beside the hot path's own arrival-to-queue time.
+    liquidation_latencies: Vec<Duration>,
     sweeps: usize,
     slowest_sweep: Duration,
 }
@@ -236,6 +239,7 @@ impl ScanStats {
             cycle_times: Vec::new(),
             waits: Vec::new(),
             detections: Vec::new(),
+            liquidation_latencies: Vec::new(),
             sweeps: 0,
             slowest_sweep: Duration::ZERO,
         }
@@ -1238,6 +1242,20 @@ impl Liquidator {
                 liquidations
                     .retain(|intent| !skip_queue.contains(&intent.liquidatee_account.address));
                 let liquidatable = liquidations.len();
+                if let Some(oldest) = oldest {
+                    let queued_at = Instant::now();
+                    for intent in &liquidations {
+                        let latency = queued_at.saturating_duration_since(oldest);
+                        self.scan_stats.liquidation_latencies.push(latency);
+                        info!(
+                            "BACKGROUND_FOUND attempt_id={} account={} arrival_to_queue_ms={} estimated_profit_usd={:.4}",
+                            intent.attempt_id,
+                            intent.liquidatee_account.address,
+                            latency.as_millis(),
+                            intent.profit.to_num::<f64>()
+                        );
+                    }
+                }
                 self.queue.offer(&checked, liquidations);
                 self.handle_unhealthy(&accounts_to_check, &unhealthy);
                 let elapsed = started.elapsed();
@@ -1288,15 +1306,20 @@ impl Liquidator {
         );
         let (wait_median, wait_p90, wait_max) = percentiles(&stats.waits);
         let (detect_median, detect_p90, detect_max) = percentiles(&stats.detections);
+        let (found_median, found_p90, found_max) = percentiles(&stats.liquidation_latencies);
         info!(
-            "DETECTION_TIMING background path, {} batch(es): an update waited for its cycle {} ms median, {} ms p90, {} ms at most; arrival to every affected account evaluated {} ms median, {} ms p90, {} ms at most.",
+            "DETECTION_TIMING background path, {} batch(es): an update waited for its cycle {} ms median, {} ms p90, {} ms at most; arrival to every affected account evaluated {} ms median, {} ms p90, {} ms at most; {} liquidation(s) queued, arrival to queue {} ms median, {} ms p90, {} ms at most.",
             stats.detections.len(),
             wait_median,
             wait_p90,
             wait_max,
             detect_median,
             detect_p90,
-            detect_max
+            detect_max,
+            stats.liquidation_latencies.len(),
+            found_median,
+            found_p90,
+            found_max
         );
         self.scan_stats = ScanStats::new();
         self.report_hot_path();
