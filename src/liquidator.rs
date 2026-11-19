@@ -73,7 +73,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicU64},
-        Arc,
+        Arc, Mutex, MutexGuard,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -108,8 +108,8 @@ struct Sweep {
 }
 
 impl Sweep {
-    /// Whether a pass is still being worked through, so the loop should come back soon instead of
-    /// waiting out its idle timeout.
+    /// Whether a pass is still being worked through.
+    #[cfg(test)]
     fn in_progress(&self) -> bool {
         self.next < self.pass.len()
     }
@@ -155,8 +155,8 @@ impl Sweep {
 /// never for a long one (a full pass is about 60k accounts).
 const SWEEP_CHUNK: usize = 256;
 
-/// How long the loop waits for an update while a sweep pass is still in progress: it returns to the
-/// sweep at once when nothing is waiting, instead of idling a second.
+/// How long the sweep thread waits between slices. The pass is spread over [`FULL_SCAN_INTERVAL`]
+/// by how much time has elapsed, so this only keeps the thread from spinning while nothing is due.
 const SWEEP_POLL: Duration = Duration::from_millis(2);
 
 /// How long the loop waits for an update when there is nothing to sweep.
@@ -491,14 +491,14 @@ pub struct Liquidator {
     /// Watches bundles after the relays accept them and releases those accounts.
     settlement: Option<JoinHandle<()>>,
     liquidator_account: Arc<LiquidatorAccount>,
-    tag_policy: TagPolicy,
     /// Tags due, sent from a thread of their own so the scan never waits on the RPC.
     tags: Sender<DueTag>,
-    skip_reports: RateLimiter<Pubkey>,
-    /// Which borrowers updates can skip.
-    health_watch: HealthWatch,
-    sweep: Sweep,
-    scan_stats: ScanStats,
+    /// Which borrowers updates can skip. The sweep thread writes it; the update loop reads it.
+    health_watch: Arc<Mutex<HealthWatch>>,
+    scan_stats: Arc<Mutex<ScanStats>>,
+    /// Shared with the sweep, which still tags accounts it finds unhealthy.
+    tag_policy: Arc<Mutex<TagPolicy>>,
+    skip_reports: Arc<Mutex<RateLimiter<Pubkey>>>,
     /// The incremental health screen, run in shadow beside the exact evaluation; `None` when
     /// `SCREEN_SHADOW=false`.
     screener: Option<Screener>,
@@ -876,11 +876,10 @@ impl Liquidator {
             settlement,
             tags,
             liquidator_account,
-            tag_policy: TagPolicy::new(),
-            skip_reports: RateLimiter::new(SKIP_REPORT_INTERVAL),
-            health_watch: HealthWatch::default(),
-            sweep: Sweep::default(),
-            scan_stats: ScanStats::new(),
+            tag_policy: Arc::new(Mutex::new(TagPolicy::new())),
+            skip_reports: Arc::new(Mutex::new(RateLimiter::new(SKIP_REPORT_INTERVAL))),
+            health_watch: Arc::new(Mutex::new(HealthWatch::default())),
+            scan_stats: Arc::new(Mutex::new(ScanStats::new())),
             screener: std::env::var("SCREEN_SHADOW")
                 .map_or(true, |value| value != "false")
                 .then(|| Screener::new(screen::DEFAULT_THETA)),
@@ -936,31 +935,18 @@ impl Liquidator {
             ),
         }
 
+        self.spawn_sweep();
+
         info!("Staring the Liquidator loop.");
         while !self.stop_liquidator.load(Ordering::Relaxed) {
             debug!("Waiting for any data change...");
-            // Updates come first, always: while a sweep pass is under way the wait is short, so the
-            // loop goes back to it at once, but never for more than one small chunk at a time.
-            let wait = if self.sweep.in_progress() {
-                SWEEP_POLL
-            } else {
-                IDLE_WAIT
-            };
-            let changes = self.receive_geyser_updates(wait)?;
+            // The sweep runs on its own thread, so an empty wait can be the full idle timeout.
+            // An update still wakes this at once.
+            let changes = self.receive_geyser_updates(IDLE_WAIT)?;
             let oldest = changes.oldest;
             let accounts_to_check = self.accounts_to_evaluate(changes);
             if !accounts_to_check.is_empty() {
                 self.run_liquidation_cycle(accounts_to_check, false, oldest);
-            }
-            let slice = self.sweep.next_slice(Instant::now(), SWEEP_CHUNK, || {
-                self.cache
-                    .marginfi_accounts
-                    .try_get_accounts_with_liabilities()
-                    .inspect_err(|e| error!("Failed to collect accounts for the sweep: {:?}", e))
-                    .unwrap_or_default()
-            });
-            if !slice.is_empty() {
-                self.run_liquidation_cycle(slice, true, None);
             }
             self.shadow_sample();
             self.report_scan_stats();
@@ -972,7 +958,7 @@ impl Liquidator {
         self.queue.stop();
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
-                error!("A liquidation worker or the rebalancer panicked.");
+                error!("A liquidation worker, the rebalancer, or the sweep panicked.");
             }
         }
         self.executor.stop_settlement();
@@ -984,6 +970,37 @@ impl Liquidator {
         info!("The Liquidator loop is stopped.");
 
         Ok(())
+    }
+
+    /// The rolling full scan, off the update loop: a slice never stands in front of a Geyser batch.
+    fn spawn_sweep(&mut self) {
+        let evaluator = Arc::clone(&self.evaluator);
+        let queue = Arc::clone(&self.queue);
+        let cache = Arc::clone(&self.cache);
+        let health_watch = Arc::clone(&self.health_watch);
+        let scan_stats = Arc::clone(&self.scan_stats);
+        let tag_policy = Arc::clone(&self.tag_policy);
+        let skip_reports = Arc::clone(&self.skip_reports);
+        let tags = self.tags.clone();
+        let stop = Arc::clone(&self.stop_liquidator);
+        self.threads.push(
+            thread::Builder::new()
+                .name("sweep".into())
+                .spawn(move || {
+                    run_sweep(
+                        evaluator,
+                        queue,
+                        cache,
+                        health_watch,
+                        scan_stats,
+                        tag_policy,
+                        skip_reports,
+                        tags,
+                        stop,
+                    )
+                })
+                .expect("sweep thread"),
+        );
     }
 
     /// Starts the execution workers and the rebalancer. Both outlive the evaluation cycles, so a
@@ -1075,37 +1092,18 @@ impl Liquidator {
         }
     }
 
-    fn record_screen_apply(&mut self, started: Instant) {
+    fn record_screen_apply(&self, started: Instant) {
         if self.screener.is_some() {
-            self.scan_stats.screen_apply.push(started.elapsed());
+            self.lock_stats().screen_apply.push(started.elapsed());
         }
     }
 
-    /// Of a cycle's results, the accounts the exact evaluation found unhealthy that the shadow screen
-    /// did not call hot: each is a miss, the one thing the screen must never do.
-    fn shadow_check(
-        &mut self,
-        liquidations: &[PreparedLiquidatableAccount],
-        unhealthy: &[UnhealthyAccount],
-    ) {
-        let Some(screener) = self.screener.as_ref() else {
-            return;
-        };
-        let found = liquidations
-            .iter()
-            .map(|intent| intent.liquidatee_account.address)
-            .chain(unhealthy.iter().map(|account| account.address));
-        for address in found {
-            self.scan_stats.screen_checked += 1;
-            if !screener.is_hot(&address) {
-                self.scan_stats.screen_missed += 1;
-                warn!(
-                    "SCREEN_MISS account={} estimate(assets,liabilities,error)={:?}",
-                    address,
-                    screener.estimate(&address)
-                );
-            }
-        }
+    fn lock_watch(&self) -> MutexGuard<'_, HealthWatch> {
+        self.health_watch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_stats(&self) -> MutexGuard<'_, ScanStats> {
+        self.scan_stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Once a second, compares a few screened accounts' estimates with their exact health and
@@ -1143,7 +1141,9 @@ impl Liquidator {
                 let gross = assets + liabilities;
                 if gross > 0.0 {
                     let error = ((a - l) - (assets - liabilities)).abs() / gross;
-                    let stats = &mut self.scan_stats;
+                    // Field borrow, not `lock_stats()`: the screener is mutably borrowed through
+                    // `anchor` below, and a method call would borrow all of `self`.
+                    let mut stats = self.scan_stats.lock().unwrap_or_else(|e| e.into_inner());
                     stats.screen_sampled += 1;
                     stats.screen_worst = stats.screen_worst.max(error);
                     // The estimate's lower bound (health less its error bound) above the exact
@@ -1230,15 +1230,22 @@ impl Liquidator {
                     continue;
                 }
             };
-            for holder in holders {
-                if accounts.contains(&holder) {
-                    continue;
+            let mut skipped = 0;
+            {
+                let watch = self.lock_watch();
+                for holder in holders {
+                    if accounts.contains(&holder) {
+                        continue;
+                    }
+                    if watch.needs_evaluation(&holder, &current) {
+                        accounts.insert(holder);
+                    } else {
+                        skipped += 1;
+                    }
                 }
-                if self.health_watch.needs_evaluation(&holder, &current) {
-                    accounts.insert(holder);
-                } else {
-                    self.scan_stats.skipped += 1;
-                }
+            }
+            if skipped > 0 {
+                self.lock_stats().skipped += skipped;
             }
         }
         accounts.into_iter().collect()
@@ -1253,111 +1260,40 @@ impl Liquidator {
     /// batch has, and the time from that arrival to the queue is logged.
     fn run_liquidation_cycle(
         &mut self,
-        mut accounts_to_check: Vec<Pubkey>,
+        accounts_to_check: Vec<Pubkey>,
         full: bool,
         oldest: Option<Instant>,
     ) {
-        let started = Instant::now();
-        if let Some(oldest) = oldest {
-            self.scan_stats
-                .waits
-                .push(started.saturating_duration_since(oldest));
-        }
-        // The accounts without a watch go first: those are the ones closest to the line (or unhealthy
-        // already), the likeliest to be liquidatable, and a liquidation found is queued at once.
-        accounts_to_check.sort_by_key(|account| self.health_watch.is_watched(account));
-        let queue = &self.queue;
-        let on_liquidation = |intent: &PreparedLiquidatableAccount| {
-            if let Some(oldest) = oldest {
-                info!(
-                    "DETECTION_LATENCY attempt_id={} account={} arrival_to_queue_ms={} estimated_profit_usd={:.4}",
-                    intent.attempt_id,
-                    intent.liquidatee_account.address,
-                    oldest.elapsed().as_millis(),
-                    intent.profit.to_num::<f64>()
-                );
-            }
-            queue.upsert(intent.clone());
-        };
-        match self
-            .evaluator
-            .check_accounts(&accounts_to_check, &on_liquidation)
-        {
-            Ok((liquidations, unhealthy, healthy)) => {
-                if full {
-                    let missed: Vec<Pubkey> = liquidations
-                        .iter()
-                        .map(|intent| intent.liquidatee_account.address)
-                        .chain(unhealthy.iter().map(|account| account.address))
-                        .filter(|address| self.health_watch.is_watched(address))
-                        .collect();
-                    if !missed.is_empty() {
-                        warn!(
-                            "The health watch missed {} unhealthy account(s): {:?}",
-                            missed.len(),
-                            missed
-                        );
-                    }
-                }
-                // Only a healthy account with room to spare is watched; any other is evaluated on
-                // every update of its banks.
-                for account in &accounts_to_check {
-                    self.health_watch.set(*account, None);
-                }
-                for (account, watch) in healthy {
-                    self.health_watch.set(account, watch);
-                }
-                let liquidatable = liquidations.len();
-                self.shadow_check(&liquidations, &unhealthy);
-                // Each liquidation is in the queue already; this withdraws the ones an account no
-                // longer has.
-                let kept: HashSet<Pubkey> = liquidations
-                    .iter()
-                    .map(|intent| intent.liquidatee_account.address)
-                    .collect();
-                self.queue.retire_unless(&accounts_to_check, &kept);
-                self.handle_unhealthy(&accounts_to_check, &unhealthy);
-                let elapsed = started.elapsed();
-                let stats = &mut self.scan_stats;
-                stats.evaluated += accounts_to_check.len();
-                if full {
-                    stats.sweeps += 1;
-                    stats.slowest_sweep = stats.slowest_sweep.max(elapsed);
-                } else {
-                    stats.cycle_times.push(elapsed);
-                    if let Some(oldest) = oldest {
-                        stats.detections.push(oldest.elapsed());
-                    }
-                }
-                debug!(
-                    "Evaluated {} account(s) in {} ms: {} queued for liquidation, {} unhealthy but not worth liquidating.",
-                    accounts_to_check.len(),
-                    elapsed.as_millis(),
-                    liquidatable,
-                    unhealthy.len()
-                );
-            }
-            Err(err) => {
-                error!("Failed to evaluate accounts in liquidation: {}", err);
-            }
-        }
+        publish_cycle(
+            &self.evaluator,
+            &self.queue,
+            self.health_watch.as_ref(),
+            self.scan_stats.as_ref(),
+            self.skip_reports.as_ref(),
+            self.tag_policy.as_ref(),
+            &self.tags,
+            accounts_to_check,
+            full,
+            oldest,
+            true,
+            self.screener.as_ref(),
+        );
     }
 
     /// Reports the evaluation work done since the last report, once a minute.
-    fn report_scan_stats(&mut self) {
-        let stats = &self.scan_stats;
+    fn report_scan_stats(&self) {
+        let mut stats = self.lock_stats();
         if stats.since.elapsed() < SCAN_REPORT_INTERVAL {
             return;
         }
+        let elapsed = stats.since.elapsed().as_secs();
         let (median, p90, slowest) = stats.cycle_percentiles();
         let (wait_median, wait_p90, wait_max) = percentiles(&stats.waits);
         let (detect_median, detect_p90, detect_max) = percentiles(&stats.detections);
-        if let Some(screener) = &self.screener {
+        let screen = self.screener.as_ref().map(|screener| {
             let (apply_median, apply_p90, apply_max) = percentiles(&stats.screen_apply);
             let (live, hot) = screener.counts();
-            info!(
-                "SCREEN_SHADOW in the last {} s: {} account(s) screened, {} hot; {} batch(es) taken in {} ms median, {} ms p90, {} ms at most; {} of {} exact-unhealthy account(s) missed; {} sampled, {} off by over 1e-6 (worst {:.3e}), {} with a lower bound above the exact health.",
-                stats.since.elapsed().as_secs(),
+            (
                 live,
                 hot,
                 stats.screen_apply.len(),
@@ -1369,34 +1305,46 @@ impl Liquidator {
                 stats.screen_sampled,
                 stats.screen_off,
                 stats.screen_worst,
-                stats.screen_over
+                stats.screen_over,
+            )
+        });
+        let cycles = stats.cycle_times.len();
+        let batches = stats.detections.len();
+        let sweeps = stats.sweeps;
+        let slowest_sweep = stats.slowest_sweep.as_millis();
+        let evaluated = stats.evaluated;
+        let skipped = stats.skipped;
+        *stats = ScanStats::new();
+        drop(stats);
+        let watched = self.lock_watch().len();
+        if let Some((
+            live,
+            hot,
+            apply_len,
+            apply_median,
+            apply_p90,
+            apply_max,
+            missed,
+            checked,
+            sampled,
+            off,
+            worst,
+            over,
+        )) = screen
+        {
+            info!(
+                "SCREEN_SHADOW in the last {} s: {} account(s) screened, {} hot; {} batch(es) taken in {} ms median, {} ms p90, {} ms at most; {} of {} exact-unhealthy account(s) missed; {} sampled, {} off by over 1e-6 (worst {:.3e}), {} with a lower bound above the exact health.",
+                elapsed, live, hot, apply_len, apply_median, apply_p90, apply_max, missed, checked, sampled, off, worst, over
             );
         }
         info!(
             "DETECTION_TIMING in the last {} s over {} batch(es): waited for evaluation {} ms median, {} ms p90, {} ms at most; arrival to every affected account evaluated {} ms median, {} ms p90, {} ms at most.",
-            stats.since.elapsed().as_secs(),
-            stats.detections.len(),
-            wait_median,
-            wait_p90,
-            wait_max,
-            detect_median,
-            detect_p90,
-            detect_max
+            elapsed, batches, wait_median, wait_p90, wait_max, detect_median, detect_p90, detect_max
         );
         info!(
             "Scans in the last {} s: {} cycle(s) on a change taking {} ms median, {} ms p90, {} ms at most; {} sweep slice(s), the slowest {} ms; {} evaluation(s), {} skipped by the health watch ({} account(s) watched).",
-            stats.since.elapsed().as_secs(),
-            stats.cycle_times.len(),
-            median,
-            p90,
-            slowest,
-            stats.sweeps,
-            stats.slowest_sweep.as_millis(),
-            stats.evaluated,
-            stats.skipped,
-            self.health_watch.len()
+            elapsed, cycles, median, p90, slowest, sweeps, slowest_sweep, evaluated, skipped, watched
         );
-        self.scan_stats = ScanStats::new();
     }
 
     fn receive_geyser_updates(&self, wait: Duration) -> Result<Changes> {
@@ -1540,41 +1488,7 @@ impl Liquidator {
         Ok(())
     }
 
-    /// Reports the unhealthy accounts we are not liquidating and tags the ones the tag policy says
-    /// are due.
-    fn handle_unhealthy(&mut self, checked: &[Pubkey], unhealthy: &[UnhealthyAccount]) {
-        let now = Instant::now();
-        self.skip_reports.prune(now);
-        for account in unhealthy {
-            if self.skip_reports.allow(account.address, now) {
-                self.report_skipped(account);
-            }
-        }
-
-        let candidates = unhealthy.iter().map(|account| Candidate {
-            address: account.address,
-            taggable: account.taggable,
-            balances: &account.balances,
-        });
-        let due = self.tag_policy.observe(checked, candidates, now);
-        if due.is_empty() {
-            return;
-        }
-        let by_address: HashMap<Pubkey, &UnhealthyAccount> =
-            unhealthy.iter().map(|a| (a.address, a)).collect();
-        for (address, waited) in due {
-            let tag = DueTag {
-                address,
-                observation_accounts: by_address[&address].observation_accounts.clone(),
-                waited,
-            };
-            if self.tags.send(tag).is_err() {
-                error!("Failed to tag {address}: the tagging thread is gone");
-            }
-        }
-    }
-
-    fn report_skipped(&self, account: &UnhealthyAccount) {
+    fn report_skipped(account: &UnhealthyAccount, min_profit: f64) {
         info!(
             "LIQUIDATION_SIZING attempt_id={} outcome=below_min_profit account={} asset_bank={} liab_bank={} maintenance_health_usd={:.6} max_repay_usd={:.6} planned_repay_usd={:.6} estimated_profit_usd={:.6} premium_pct={:.4} binding_cap={} cap_debt_usd={:.4} cap_collateral_usd={:.4} cap_equity_usd={:?} cap_health_usd={:?} min_profit_usd={:.4} tagged_at={} taggable={}",
             account.attempt_id,
@@ -1591,10 +1505,241 @@ impl Liquidator {
             account.caps.collateral_usd,
             account.caps.equity_usd,
             account.caps.health_usd,
-            self.evaluator.min_profit,
+            min_profit,
             account.tagged_at,
             account.taggable
         );
+    }
+}
+
+/// Evaluates `accounts_to_check`, queues each liquidation as it is found, and records the health
+/// watch. `parallel` is for a change batch. A sweep slice passes `false` and no screener, so it
+/// neither takes the rayon pool nor touches the shadow screen.
+#[allow(clippy::too_many_arguments)]
+fn publish_cycle(
+    evaluator: &Evaluator,
+    queue: &ExecutionQueue,
+    health_watch: &Mutex<HealthWatch>,
+    scan_stats: &Mutex<ScanStats>,
+    skip_reports: &Mutex<RateLimiter<Pubkey>>,
+    tag_policy: &Mutex<TagPolicy>,
+    tags: &Sender<DueTag>,
+    mut accounts_to_check: Vec<Pubkey>,
+    full: bool,
+    oldest: Option<Instant>,
+    parallel: bool,
+    screener: Option<&Screener>,
+) {
+    let started = Instant::now();
+    if let Some(oldest) = oldest {
+        scan_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waits
+            .push(started.saturating_duration_since(oldest));
+    }
+    {
+        let watch = health_watch.lock().unwrap_or_else(|e| e.into_inner());
+        accounts_to_check.sort_by_key(|account| watch.is_watched(account));
+    }
+    let on_liquidation = |intent: &PreparedLiquidatableAccount| {
+        if let Some(oldest) = oldest {
+            info!(
+                "DETECTION_LATENCY attempt_id={} account={} arrival_to_queue_ms={} estimated_profit_usd={:.4}",
+                intent.attempt_id,
+                intent.liquidatee_account.address,
+                oldest.elapsed().as_millis(),
+                intent.profit.to_num::<f64>()
+            );
+        }
+        queue.upsert(intent.clone());
+    };
+    let Ok((liquidations, unhealthy, healthy)) = evaluator
+        .check_accounts(&accounts_to_check, &on_liquidation, parallel)
+        .inspect_err(|err| error!("Failed to evaluate accounts in liquidation: {}", err))
+    else {
+        return;
+    };
+    write_health_watch(
+        health_watch,
+        &accounts_to_check,
+        &liquidations,
+        &unhealthy,
+        healthy,
+        full,
+    );
+    if let Some(screener) = screener {
+        let found = liquidations
+            .iter()
+            .map(|intent| intent.liquidatee_account.address)
+            .chain(unhealthy.iter().map(|account| account.address));
+        for address in found {
+            let mut stats = scan_stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.screen_checked += 1;
+            if !screener.is_hot(&address) {
+                stats.screen_missed += 1;
+                warn!(
+                    "SCREEN_MISS account={} estimate(assets,liabilities,error)={:?}",
+                    address,
+                    screener.estimate(&address)
+                );
+            }
+        }
+    }
+    let kept: HashSet<Pubkey> = liquidations
+        .iter()
+        .map(|intent| intent.liquidatee_account.address)
+        .collect();
+    queue.retire_unless(&accounts_to_check, &kept);
+    note_unhealthy(
+        skip_reports,
+        tag_policy,
+        tags,
+        evaluator.min_profit,
+        &accounts_to_check,
+        &unhealthy,
+    );
+    let elapsed = started.elapsed();
+    {
+        let mut stats = scan_stats.lock().unwrap_or_else(|e| e.into_inner());
+        stats.evaluated += accounts_to_check.len();
+        if full {
+            stats.sweeps += 1;
+            stats.slowest_sweep = stats.slowest_sweep.max(elapsed);
+        } else {
+            stats.cycle_times.push(elapsed);
+            if let Some(oldest) = oldest {
+                stats.detections.push(oldest.elapsed());
+            }
+        }
+    }
+    debug!(
+        "Evaluated {} account(s) in {} ms: {} queued for liquidation, {} unhealthy but not worth liquidating.",
+        accounts_to_check.len(),
+        elapsed.as_millis(),
+        liquidations.len(),
+        unhealthy.len()
+    );
+}
+
+/// The health-watch half of a cycle, shared by the update loop and the sweep thread.
+fn write_health_watch(
+    health_watch: &Mutex<HealthWatch>,
+    accounts: &[Pubkey],
+    liquidations: &[PreparedLiquidatableAccount],
+    unhealthy: &[UnhealthyAccount],
+    healthy: Vec<(Pubkey, Option<Watch>)>,
+    full: bool,
+) {
+    let mut watch = health_watch.lock().unwrap_or_else(|e| e.into_inner());
+    if full {
+        let missed: Vec<Pubkey> = liquidations
+            .iter()
+            .map(|intent| intent.liquidatee_account.address)
+            .chain(unhealthy.iter().map(|account| account.address))
+            .filter(|address| watch.is_watched(address))
+            .collect();
+        if !missed.is_empty() {
+            warn!(
+                "The health watch missed {} unhealthy account(s): {:?}",
+                missed.len(),
+                missed
+            );
+        }
+    }
+    for account in accounts {
+        watch.set(*account, None);
+    }
+    for (account, kept) in healthy {
+        watch.set(account, kept);
+    }
+}
+
+fn note_unhealthy(
+    skip_reports: &Mutex<RateLimiter<Pubkey>>,
+    tag_policy: &Mutex<TagPolicy>,
+    tags: &Sender<DueTag>,
+    min_profit: f64,
+    checked: &[Pubkey],
+    unhealthy: &[UnhealthyAccount],
+) {
+    let now = Instant::now();
+    {
+        let mut reports = skip_reports.lock().unwrap_or_else(|e| e.into_inner());
+        reports.prune(now);
+        for account in unhealthy {
+            if reports.allow(account.address, now) {
+                Liquidator::report_skipped(account, min_profit);
+            }
+        }
+    }
+    let due = {
+        let mut policy = tag_policy.lock().unwrap_or_else(|e| e.into_inner());
+        let candidates = unhealthy.iter().map(|account| Candidate {
+            address: account.address,
+            taggable: account.taggable,
+            balances: &account.balances,
+        });
+        policy.observe(checked, candidates, now)
+    };
+    if due.is_empty() {
+        return;
+    }
+    let by_address: HashMap<Pubkey, &UnhealthyAccount> = unhealthy
+        .iter()
+        .map(|account| (account.address, account))
+        .collect();
+    for (address, waited) in due {
+        let tag = DueTag {
+            address,
+            observation_accounts: by_address[&address].observation_accounts.clone(),
+            waited,
+        };
+        if tags.send(tag).is_err() {
+            error!("Failed to tag {address}: the tagging thread is gone");
+        }
+    }
+}
+
+/// One rolling pass of every borrower, a slice at a time, until `stop` is set.
+#[allow(clippy::too_many_arguments)]
+fn run_sweep(
+    evaluator: Arc<Evaluator>,
+    queue: Arc<ExecutionQueue>,
+    cache: Arc<Cache>,
+    health_watch: Arc<Mutex<HealthWatch>>,
+    scan_stats: Arc<Mutex<ScanStats>>,
+    tag_policy: Arc<Mutex<TagPolicy>>,
+    skip_reports: Arc<Mutex<RateLimiter<Pubkey>>>,
+    tags: Sender<DueTag>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut sweep = Sweep::default();
+    while !stop.load(Ordering::Relaxed) {
+        let slice = sweep.next_slice(Instant::now(), SWEEP_CHUNK, || {
+            cache
+                .marginfi_accounts
+                .try_get_accounts_with_liabilities()
+                .inspect_err(|e| error!("Failed to collect accounts for the sweep: {:?}", e))
+                .unwrap_or_default()
+        });
+        if !slice.is_empty() {
+            publish_cycle(
+                &evaluator,
+                &queue,
+                health_watch.as_ref(),
+                scan_stats.as_ref(),
+                skip_reports.as_ref(),
+                tag_policy.as_ref(),
+                &tags,
+                slice,
+                true,
+                None,
+                false,
+                None,
+            );
+        }
+        thread::sleep(SWEEP_POLL);
     }
 }
 
@@ -1810,39 +1955,44 @@ impl Evaluator {
     /// Evaluates `account_addresses`, calling `on_liquidation` with each liquidation the moment its
     /// evaluation finishes (from the pool's threads, so before the rest of the batch is done) and
     /// returning all the results once the batch is.
+    /// `parallel` uses the shared rayon pool. The sweep passes `false` so a slice does not take
+    /// the cores an update batch is using.
     fn check_accounts(
         &self,
         account_addresses: &[Pubkey],
         on_liquidation: &(impl Fn(&PreparedLiquidatableAccount) + Sync),
+        parallel: bool,
     ) -> Result<Evaluations> {
         let clock = clock_manager::get_clock(&self.cache.clock)?;
         let unit_values = UnitValues::new(&self.cache, &clock);
 
-        // Evaluation is CPU-bound (oracle parsing + health math) and independent per account, so a
-        // full scan of every borrower parallelises cleanly across cores.
-        let evaluations: Vec<Evaluation> = account_addresses
-            .par_iter()
-            .filter_map(|account_address| {
-                let account = self
-                    .cache
-                    .marginfi_accounts
-                    .try_get_account(account_address)
-                    .ok()?;
+        let one = |account_address: &Pubkey| {
+            let account = self
+                .cache
+                .marginfi_accounts
+                .try_get_account(account_address)
+                .ok()?;
 
-                match self.process_account(&account, clock.clone(), &unit_values) {
-                    Ok(acc_opt) => {
-                        if let Some(Evaluation::Liquidate(intent)) = &acc_opt {
-                            on_liquidation(intent);
-                        }
-                        acc_opt
+            match self.process_account(&account, clock.clone(), &unit_values) {
+                Ok(acc_opt) => {
+                    if let Some(Evaluation::Liquidate(intent)) = &acc_opt {
+                        on_liquidation(intent);
                     }
-                    Err(err) => {
-                        debug!("Failed to process account {:?}: {:?}", account.address, err);
-                        None
-                    }
+                    acc_opt
                 }
-            })
-            .collect();
+                Err(err) => {
+                    debug!("Failed to process account {:?}: {:?}", account.address, err);
+                    None
+                }
+            }
+        };
+        // Evaluation is CPU-bound (oracle parsing + health math) and independent per account, so a
+        // batch on a change parallelises across cores. A sweep slice stays on this thread.
+        let evaluations: Vec<Evaluation> = if parallel {
+            account_addresses.par_iter().filter_map(&one).collect()
+        } else {
+            account_addresses.iter().filter_map(&one).collect()
+        };
 
         let mut liquidations = Vec::new();
         let mut unhealthy = Vec::new();
@@ -2937,6 +3087,61 @@ mod sweep_tests {
         let next: Vec<Pubkey> = (0..60).map(|_| Pubkey::new_unique()).collect();
         let slice = sweep.next_slice(start + step * 61, usize::MAX, || next.clone());
         assert_eq!(slice, next[..1]);
+    }
+
+    #[test]
+    fn a_pass_is_not_collected_again_inside_the_interval() {
+        let borrowers: Vec<Pubkey> = (0..30).map(|_| Pubkey::new_unique()).collect();
+        let mut sweep = Sweep::default();
+        let start = Instant::now();
+        assert!(sweep
+            .next_slice(start, usize::MAX, || borrowers.clone())
+            .is_empty());
+
+        let halfway = sweep.next_slice(start + FULL_SCAN_INTERVAL / 2, usize::MAX, || {
+            unreachable!("the pass is still owed")
+        });
+        assert_eq!(halfway.len(), 15);
+        assert!(sweep.in_progress());
+
+        let mut calls = 0;
+        let mut empty = Sweep::default();
+        assert!(empty
+            .next_slice(start, 10, || {
+                calls += 1;
+                Vec::new()
+            })
+            .is_empty());
+        assert!(empty
+            .next_slice(start + Duration::from_secs(1), 10, || {
+                calls += 1;
+                vec![Pubkey::new_unique()]
+            })
+            .is_empty());
+        assert_eq!(calls, 1, "an empty collection waits out the interval");
+    }
+
+    #[test]
+    fn a_sweep_health_update_is_visible_to_needs_evaluation() {
+        let shared = Mutex::new(HealthWatch::default());
+        let account = Pubkey::new_unique();
+        let bank = Pubkey::new_unique();
+        let watch = Watch::new(
+            0.05,
+            vec![WatchedPosition {
+                bank,
+                liability: false,
+                unit_value: 1.0,
+            }],
+        );
+        write_health_watch(&shared, &[account], &[], &[], vec![(account, watch)], true);
+        let current = HashMap::from([((bank, false), 1.0)]);
+        assert!(
+            !shared.lock().unwrap().needs_evaluation(&account, &current),
+            "the update path sees the watch the sweep wrote"
+        );
+        let moved = HashMap::from([((bank, false), 1.2)]);
+        assert!(shared.lock().unwrap().needs_evaluation(&account, &moved));
     }
 }
 
