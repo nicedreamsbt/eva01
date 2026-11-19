@@ -11,7 +11,7 @@
 //! repays with, so concurrent plans never count the same tokens. The seized collateral stays in
 //! the wallet for the rebalancer.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{anyhow, Result};
 use fixed::types::I80F48;
@@ -34,7 +34,10 @@ use crate::wrappers::{
 };
 
 use super::{
-    reservations::TokenReservations, ExecutionPlan, Landing, LiquidationStrategy, Sandwich,
+    reservations::TokenReservations,
+    trace,
+    venues::{self, VenueSet},
+    ExecutionPlan, Landing, LiquidationStrategy, Sandwich,
 };
 
 /// A liquidation that was built but failed its simulation, as opposed to one that could not be
@@ -93,7 +96,8 @@ const RECEIVERSHIP_SWAP_PROGRAMS: [Pubkey; 3] = [
 
 pub struct InventoryStrategy {
     liquidator_account: Arc<LiquidatorAccount>,
-    dex_client: Arc<DexSuperAggClient>,
+    /// The swap venues, each its own client, within their rate limits.
+    venues: Arc<VenueSet<DexSuperAggClient>>,
     dex_gate: Arc<DexGate>,
     tokio_rt: Runtime,
     slippage_bps: u16,
@@ -104,7 +108,7 @@ pub struct InventoryStrategy {
 impl InventoryStrategy {
     pub fn new(
         liquidator_account: Arc<LiquidatorAccount>,
-        dex_client: Arc<DexSuperAggClient>,
+        venues: Arc<VenueSet<DexSuperAggClient>>,
         dex_gate: Arc<DexGate>,
         slippage_bps: u16,
         min_profit: f64,
@@ -122,7 +126,7 @@ impl InventoryStrategy {
         Ok(Self {
             liquidator_account,
             dex_gate,
-            dex_client,
+            venues,
             tokio_rt,
             slippage_bps,
             min_profit,
@@ -202,13 +206,18 @@ impl InventoryStrategy {
                 self.slippage_bps,
             )
         };
-        let swap = self
-            .tokio_rt
-            .block_on(async {
-                let _permit = self.dex_gate.acquire().await?;
-                self.dex_client.build_swap_instructions(&request).await
-            })?
-            .swap_remove(0);
+        // The schedule asks Jupiter within its pace, and Titan (one request a second) when the
+        // liquidation is worth its slot or Jupiter cannot route it.
+        let profit_usd = intent.profit.to_num::<f64>();
+        let quoted = Instant::now();
+        let routed = self.tokio_rt.block_on(async {
+            let _permit = self.dex_gate.acquire().await?;
+            self.venues.route(&request, profit_usd).await
+        })?;
+        venues::log_routed(intent.attempt_id, &routed, quoted.elapsed());
+        trace::note("quote_venue", format!("{:?}", routed.swap.aggregator));
+        trace::note("quote_ms", quoted.elapsed().as_millis());
+        let swap = routed.swap;
         info!(
             "InventoryStrategy: selling {} {} for at least {} {} in-tx via {:?} (repaying {})",
             asset_amount, asset_mint, swap.min_out_amount, liab_mint, swap.aggregator, repay_amount

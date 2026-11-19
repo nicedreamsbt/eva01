@@ -12,6 +12,7 @@ pub mod inventory;
 pub mod queue;
 pub mod reservations;
 pub mod trace;
+pub mod venues;
 
 use crate::wrappers::liquidator_account::PreparedLiquidatableAccount;
 use anyhow::Result;

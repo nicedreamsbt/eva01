@@ -15,6 +15,7 @@ use crate::{
         queue::{ExecutionQueue, QueuedIntent},
         reservations::TokenReservations,
         trace::{self, AttemptTrace, DetectionPath, Stage},
+        venues,
     },
     geyser::{AccountType, GeyserUpdate},
     health_watch::{self, HealthWatch, Watch, WatchedPosition},
@@ -526,6 +527,8 @@ pub struct Liquidator {
     hot: Arc<Mutex<HotList>>,
     hot_config: HotConfig,
     hot_stats: Arc<Mutex<HotStats>>,
+    /// The swap venues' rate limits, reported each minute.
+    venue_limits: Arc<venues::VenueLimits>,
     /// Where each account last stood, to size the hot list in the minute report.
     standings: HashMap<Pubkey, Standing>,
     stop_liquidator: Arc<AtomicBool>,
@@ -846,7 +849,8 @@ impl Liquidator {
             reservations.clone(),
             activity.clone(),
         )?;
-        let dex_client = rebalancer.liquidation_dex_client();
+        let venues = rebalancer.liquidation_venues();
+        let venue_limits = rebalancer.venue_limits();
         // Not the rebalancer's gate: a sweep must not hold a slot a liquidation quote is waiting on.
         let dex_gate = Arc::new(liquidation_dex_gate());
 
@@ -888,7 +892,7 @@ impl Liquidator {
 
         let strategy = InventoryStrategy::new(
             liquidator_account.clone(),
-            dex_client,
+            venues,
             dex_gate,
             config.slippage_bps,
             config.min_profit,
@@ -950,6 +954,7 @@ impl Liquidator {
             hot,
             hot_config,
             hot_stats,
+            venue_limits,
             standings: HashMap::new(),
             stop_liquidator,
             cache,
@@ -1340,6 +1345,9 @@ impl Liquidator {
         self.scan_stats = ScanStats::new();
         self.report_hot_path();
         for line in trace::take_summary() {
+            info!("{line}");
+        }
+        if let Some(line) = self.venue_limits.take_report() {
             info!("{line}");
         }
     }

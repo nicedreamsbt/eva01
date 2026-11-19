@@ -4,6 +4,7 @@ use crate::{
     execution::{
         activity::LiquidationActivity,
         reservations::{Claim, TokenReservations},
+        venues::{Venue, VenueConfig, VenueLimits, VenueSet},
     },
     utils::{accessor, rate_limiter::RateLimiter},
     wrappers::{oracle::OracleWrapper, token_account::TokenAccountWrapper},
@@ -39,10 +40,10 @@ pub const DEFAULT_DEX_CONCURRENCY: usize = 2;
 /// this keeps the request rate steady instead.
 pub const DEFAULT_DEX_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Liquidation quotes. Same concurrency as the rebalancer, but they start closer together so a
-/// worker is not paced like a sweep. `LIQ_DEX_CONCURRENCY` and `LIQ_DEX_MIN_INTERVAL_MS` override.
-pub const LIQ_DEX_CONCURRENCY: usize = DEFAULT_DEX_CONCURRENCY;
-pub const LIQ_DEX_MIN_INTERVAL: Duration = Duration::from_millis(100);
+/// Liquidation quotes. The venues' own limits pace them (`VenueLimits`), so this gate only bounds how
+/// many are in flight at once. `LIQ_DEX_CONCURRENCY` and `LIQ_DEX_MIN_INTERVAL_MS` override.
+pub const LIQ_DEX_CONCURRENCY: usize = 16;
+pub const LIQ_DEX_MIN_INTERVAL: Duration = Duration::ZERO;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -78,6 +79,9 @@ pub fn liquidation_dex_gate() -> DexGate {
 
 /// How long the other venues still get once one returns a quote that covers a liquidation.
 const LIQUIDATION_QUOTE_GRACE: Duration = Duration::from_millis(100);
+
+/// A rebalancing swap uses a venue's limit only after the liquidations have left it alone this long.
+const BACKGROUND_QUIET: Duration = Duration::from_secs(2);
 
 /// How long a swap venue gets to quote, or to build its route, before it is left out.
 const SWAP_VENUE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -199,8 +203,13 @@ pub struct Rebalancer {
     cache: Arc<Cache>,
     /// The rebalancer's own swaps, under the venues' default deadlines: nothing races them.
     dex_client: Arc<DexSuperAggClient>,
-    /// The liquidations' swaps, under [`SWAP_VENUE_TIMEOUT`].
-    liquidation_dex_client: Arc<DexSuperAggClient>,
+    /// The liquidations' swaps: a client per venue under [`SWAP_VENUE_TIMEOUT`], and the schedule
+    /// that keeps each within its rate limit.
+    liquidation_venues: Arc<VenueSet<DexSuperAggClient>>,
+    /// The venues' rate limits, which the rebalancer's own swaps also draw on, behind the liquidations.
+    venue_limits: Arc<VenueLimits>,
+    /// The routes each of the rebalancer's swaps costs the venues it asks.
+    background_costs: Vec<(Venue, u32)>,
     dex_gate: Arc<DexGate>,
     empty_stake_banks: HashSet<Pubkey>,
     unsweepable_mints: HashMap<Pubkey, u64>,
@@ -298,15 +307,55 @@ impl Rebalancer {
         };
         let signer = || Keypair::try_from(config.wallet_keypair.as_slice());
         let dex_client = Arc::new(DexSuperAggClient::new(client_config, signer()?)?);
-        let liquidation_dex_client =
-            Arc::new(DexSuperAggClient::new(liquidation_config, signer()?)?);
+        // One client per venue for liquidations, so the schedule can ask each within its own limit
+        // (a client over all of them asks every venue on every quote).
+        let single = |jupiter: bool, titan: bool, dflow: bool| ClientConfig {
+            jupiter: liquidation_config.jupiter.clone().filter(|_| jupiter),
+            titan: liquidation_config.titan.clone().filter(|_| titan),
+            dflow: liquidation_config.dflow.clone().filter(|_| dflow),
+            ..liquidation_config.clone()
+        };
+        let venue_client =
+            |config: ClientConfig, present: bool| -> anyhow::Result<Option<DexSuperAggClient>> {
+                present
+                    .then(|| DexSuperAggClient::new(config, signer()?))
+                    .transpose()
+            };
+        let venue_limits = Arc::new(VenueLimits::from_env());
+        let liquidation_venues = Arc::new(VenueSet {
+            jupiter: venue_client(
+                single(true, false, false),
+                liquidation_config.jupiter.is_some(),
+            )?,
+            titan: venue_client(
+                single(false, true, false),
+                liquidation_config.titan.is_some(),
+            )?,
+            dflow: venue_client(
+                single(false, false, true),
+                liquidation_config.dflow.is_some(),
+            )?,
+            limits: venue_limits.clone(),
+            config: VenueConfig::from_env(),
+        });
+        let background_costs: Vec<(Venue, u32)> = [
+            (Venue::Jupiter, liquidation_config.jupiter.is_some()),
+            (Venue::Titan, liquidation_config.titan.is_some()),
+            (Venue::Dflow, liquidation_config.dflow.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(venue, _)| (venue, 1))
+        .collect();
 
         Ok(Self {
             swap_mint,
             tokio_rt,
             cache,
             dex_client,
-            liquidation_dex_client,
+            liquidation_venues,
+            venue_limits,
+            background_costs,
             dex_gate: Arc::new(rebalancer_dex_gate()),
             empty_stake_banks: HashSet::new(),
             unsweepable_mints: HashMap::new(),
@@ -327,9 +376,14 @@ impl Rebalancer {
         })
     }
 
-    /// The swap client liquidations quote and build on.
-    pub fn liquidation_dex_client(&self) -> Arc<DexSuperAggClient> {
-        Arc::clone(&self.liquidation_dex_client)
+    /// The venues liquidations quote and build on, with the schedule between them.
+    pub fn liquidation_venues(&self) -> Arc<VenueSet<DexSuperAggClient>> {
+        Arc::clone(&self.liquidation_venues)
+    }
+
+    /// The venues' rate limits, for the minute report.
+    pub fn venue_limits(&self) -> Arc<VenueLimits> {
+        Arc::clone(&self.venue_limits)
     }
 
     /// Bring every inventory token back into its band, and sell every other unclaimed token the
@@ -594,6 +648,10 @@ impl Rebalancer {
             // The gate admits aggregator calls only; waiting for the confirmation must not hold a
             // slot the liquidation workers need for their quotes.
             let prepared = {
+                // Behind the liquidations: only when they have not wanted these venues for a while.
+                self.venue_limits
+                    .acquire_background(&self.background_costs, BACKGROUND_QUIET)
+                    .await;
                 let _permit = self.dex_gate.acquire().await?;
                 self.dex_client
                     .build_swap_transaction(input_mint, output_mint, amount, min_out)
